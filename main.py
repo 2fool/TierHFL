@@ -294,11 +294,16 @@ class EnhancedSerialTrainer:
         client_model.to(self.device).train()
         self.server_model.load_state_dict(server_model.state_dict())
         self.global_classifier.load_state_dict(global_classifier.state_dict())
-        self.server_model.to(self.device).eval()          # server端抽特征，先eval更稳定
+        
+        # 🔥 关键修复：让server_model也参与训练，而不是eval()
+        self.server_model.to(self.device).train()        # 从eval()改为train()
         self.global_classifier.to(self.device).train()
 
-        # 放到to(device)之后再建优化器
-        optimizer = torch.optim.SGD(
+        # 🔥 关键修复：为server_model和global_classifier分别创建优化器
+        opt_server = torch.optim.SGD(
+            self.server_model.parameters(), lr=client.lr, momentum=0.9, weight_decay=5e-4
+        )
+        opt_classifier = torch.optim.SGD(
             self.global_classifier.parameters(), lr=client.lr, momentum=0.9, weight_decay=5e-4
         )
 
@@ -309,7 +314,10 @@ class EnhancedSerialTrainer:
             data   = data.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
+            # 🔥 关键修复：两个优化器都要清零梯度
+            opt_server.zero_grad(set_to_none=True)
+            opt_classifier.zero_grad(set_to_none=True)
+            
             with torch.cuda.amp.autocast(enabled=use_amp):
                 local_logits, shared_features, _ = client_model(data)
                 server_features = self.server_model(shared_features)
@@ -318,13 +326,24 @@ class EnhancedSerialTrainer:
                     global_logits, target, shared_features=shared_features
                 )
 
+            # 🔥 关键修复：AMP支持两个优化器
             if use_amp:
                 self.scaler.scale(total_loss).backward()
-                self.scaler.step(optimizer)
+                # 先unscale再做梯度裁剪
+                self.scaler.unscale_(opt_server)
+                self.scaler.unscale_(opt_classifier)
+                torch.nn.utils.clip_grad_norm_(list(self.server_model.parameters()), 1.0)
+                torch.nn.utils.clip_grad_norm_(list(self.global_classifier.parameters()), 1.0)
+                # 两个优化器都要step
+                self.scaler.step(opt_server)
+                self.scaler.step(opt_classifier)
                 self.scaler.update()
             else:
                 total_loss.backward()
-                optimizer.step()
+                torch.nn.utils.clip_grad_norm_(list(self.server_model.parameters()), 1.0)
+                torch.nn.utils.clip_grad_norm_(list(self.global_classifier.parameters()), 1.0)
+                opt_server.step()
+                opt_classifier.step()
 
             running_loss += float(total_loss.detach())
             with torch.no_grad():
@@ -1090,6 +1109,26 @@ def load_global_test_set(args):
         # 默认返回CIFAR10
         raise ValueError(f"Unsupported dataset: {args.dataset}")
 
+def evaluate_global_model_multi_client(client_models, server_model, global_classifier, global_test_loader, device, num_eval_clients=3):
+    """🔥 使用多个客户端进行全局模型评估，提高评估稳健性"""
+    # 选择多个客户端进行评估
+    client_ids = list(client_models.keys())
+    eval_client_ids = client_ids[:min(num_eval_clients, len(client_ids))]
+    
+    all_accuracies = []
+    
+    for client_id in eval_client_ids:
+        client_model = client_models[client_id]
+        accuracy = evaluate_global_model(client_model, server_model, global_classifier, global_test_loader, device)
+        all_accuracies.append(accuracy)
+        print(f"📈 客户端{client_id}评估准确率: {accuracy:.2f}%")
+    
+    # 返回平均准确率
+    avg_accuracy = sum(all_accuracies) / len(all_accuracies)
+    print(f"📈 多客户端平均评估准确率: {avg_accuracy:.2f}%")
+    
+    return avg_accuracy
+
 def evaluate_global_model(client_model, server_model, global_classifier, global_test_loader, device):
     """评估全局模型在全局测试集上的性能 - 修复版"""
     # 确保所有模型都在正确的设备上
@@ -1130,16 +1169,6 @@ def evaluate_global_model(client_model, server_model, global_classifier, global_
                 continue
     
     accuracy = 100.0 * correct / max(1, total)
-    
-    # 记录额外的调试信息
-    logging.info(f"全局模型评估 - 样本总数: {total}, 正确预测: {correct}")
-    if len(all_predictions) >= 100:
-        # 打印预测分布
-        from collections import Counter
-        pred_counter = Counter(all_predictions)
-        target_counter = Counter(all_targets)
-        logging.info(f"预测分布: {dict(pred_counter)}")
-        logging.info(f"目标分布: {dict(target_counter)}")
     
     return accuracy
 
@@ -1257,8 +1286,8 @@ def main():
     args = parse_arguments()
 
     # 添加新参数（如果你这几行就是手动给默认值，也可以保留）
-    args.initial_phase_rounds = 10     # 初始阶段轮数
-    args.alternating_phase_rounds = 20 # 交替训练阶段轮数
+    args.initial_phase_rounds = 2      # 🔥 关键修复：从10轮改为2轮，尽快进入alternating阶段
+    args.alternating_phase_rounds = 198 # 🔥 让主体训练落在alternating阶段
     args.fine_tuning_phase_rounds = 0  # 精细调整阶段轮数（可先设 0）
 
     log_file = setup_logging(run_name=getattr(args, "running_name", "run"))
@@ -1455,16 +1484,10 @@ def main():
         
         aggregation_time = time.time() - aggregation_start_time
         
-        # 评估全局模型
-        tier1_clients = [cid for cid, resource in client_resources.items() if resource['tier'] == 1]
-        if tier1_clients:
-            sample_client_id = tier1_clients[0]
-        else:
-            sample_client_id = list(client_models.keys())[0]
-            
-        global_model_accuracy = evaluate_global_model(
-            client_models[sample_client_id], server_model, global_classifier, 
-            global_test_loader, device)
+        # 🔥 优化：使用多客户端评估全局模型，提高评估稳健性
+        global_model_accuracy = evaluate_global_model_multi_client(
+            client_models, server_model, global_classifier, 
+            global_test_loader, device, num_eval_clients=3)
         
         # 计算平均准确率
         avg_local_acc = np.mean([result.get('local_accuracy', 0) for result in eval_results.values()])

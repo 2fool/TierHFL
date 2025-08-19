@@ -13,7 +13,7 @@ import copy
 import os
 from datetime import datetime
 
-def analyze_server_features(server_model, client_model, global_test_loader, device='cpu'):
+def analyze_server_features(server_model, client_model, global_test_loader, device='cpu', num_classes=None):
     """分析服务器提取特征的可分性"""
     server_model.eval()
     client_model.eval()  # 使用传入的单个客户端模型
@@ -35,9 +35,13 @@ def analyze_server_features(server_model, client_model, global_test_loader, devi
     features_all = torch.cat(features_all, dim=0)
     labels_all = torch.cat(labels_all, dim=0)
     
+    # 🔥 动态获取类别数
+    if num_classes is None:
+        num_classes = int(labels_all.max().item()) + 1
+    
     # 计算类内/类间距离比
     class_means = {}
-    for c in range(10):  # 假设10个类别
+    for c in range(num_classes):  # 🔥 使用动态类别数
         class_idx = (labels_all == c).nonzero(as_tuple=True)[0]
         if len(class_idx) > 0:  # 确保该类有样本
             class_means[c] = features_all[class_idx].mean(dim=0)
@@ -45,7 +49,7 @@ def analyze_server_features(server_model, client_model, global_test_loader, devi
     # 类内距离
     intra_class_dist = 0
     num_classes_with_samples = 0
-    for c in range(10):
+    for c in range(num_classes):  # 🔥 使用动态类别数
         class_idx = (labels_all == c).nonzero(as_tuple=True)[0]
         if len(class_idx) > 0:
             class_features = features_all[class_idx]
@@ -105,7 +109,7 @@ def test_with_simple_classifier(server_model, client_model, global_test_loader, 
     
     return accuracy
 
-def analyze_feature_consistency(server_model, client_models, test_data_dict, device='cpu'):
+def analyze_feature_consistency(server_model, client_models, test_data_dict, device='cpu', num_classes=None):
     """分析不同客户端间特征的一致性"""
     server_model = server_model.to(device)
     server_model.eval()
@@ -135,6 +139,13 @@ def analyze_feature_consistency(server_model, client_models, test_data_dict, dev
             client_features[client_id] = torch.cat(features, dim=0)
             client_labels[client_id] = torch.cat(labels, dim=0)
     
+    # 🔥 动态获取类别数
+    if num_classes is None and client_labels:
+        all_labels = torch.cat(list(client_labels.values()), dim=0)
+        num_classes = int(all_labels.max().item()) + 1
+    elif num_classes is None:
+        num_classes = 100  # fallback for CIFAR-100
+    
     # 计算特征统计信息
     stats = {}
     for client_id in client_features:
@@ -152,7 +163,7 @@ def analyze_feature_consistency(server_model, client_models, test_data_dict, dev
             if i != j:
                 # 计算相同类别样本的特征相似度
                 sim_by_class = {}
-                for c in range(10):  # 假设10个类别
+                for c in range(num_classes):  # 🔥 使用动态类别数
                     i_idx = (client_labels[i] == c).nonzero(as_tuple=True)[0]
                     j_idx = (client_labels[j] == c).nonzero(as_tuple=True)[0]
                     
@@ -321,6 +332,25 @@ def validate_server_effectiveness(args, client_models, server_model, global_clas
     """集成验证服务器特征提取有效性的函数"""
     print("\n===== 验证服务器特征提取有效性 =====")
     
+    # 🔥 动态获取类别数
+    if hasattr(args, 'dataset') and args.dataset == 'cifar100':
+        num_classes = 100
+    elif hasattr(args, 'dataset') and args.dataset == 'cifar10':
+        num_classes = 10
+    else:
+        # 从 global_classifier 获取类别数
+        try:
+            for module in global_classifier.modules():
+                if isinstance(module, torch.nn.Linear):
+                    num_classes = module.out_features
+                    break
+            else:
+                num_classes = 100  # fallback
+        except:
+            num_classes = 100  # fallback
+    
+    print(f"🔥 使用动态类别数: {num_classes}")
+    
     # 确保服务器模型在正确设备上
     server_model = server_model.to(device)
     
@@ -331,7 +361,7 @@ def validate_server_effectiveness(args, client_models, server_model, global_clas
     try:
         # 1. 特征可分性分析
         separability, features, labels = analyze_server_features(
-            server_model, sample_client_model, global_test_loader, device=device)
+            server_model, sample_client_model, global_test_loader, device=device, num_classes=num_classes)
     except Exception as e:
         print(f"特征可分性分析出错: {str(e)}")
         separability = 0.0
@@ -347,7 +377,7 @@ def validate_server_effectiveness(args, client_models, server_model, global_clas
     try:
         # 3. 特征一致性跨客户端分析
         feature_stats, similarities, avg_similarity = analyze_feature_consistency(
-            server_model, client_models, test_data_local_dict, device=device)
+            server_model, client_models, test_data_local_dict, device=device, num_classes=num_classes)
     except Exception as e:
         print(f"特征一致性分析出错: {str(e)}")
         avg_similarity = 0.0
