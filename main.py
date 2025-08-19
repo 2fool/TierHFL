@@ -84,19 +84,42 @@ def setup_logging(run_name: str = "run",
     return str(log_path)
 
 
-# 增强版串行训练器实现
+# ========= EnhancedSerialTrainer (GPU-ready) =========
 class EnhancedSerialTrainer:
-    def __init__(self, client_manager, server_model, global_classifier, device="cpu"):
+    def __init__(self, client_manager, server_model, global_classifier, device="auto", use_amp=False):
         self.client_manager = client_manager
         self.server_model = server_model
         self.global_classifier = global_classifier
-        self.device = torch.device("cpu")
+
+        # 设备选择
+        if device == "auto":
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+            else:
+                self.device = torch.device("cpu")
+        else:
+            self.device = torch.device(device)
+
+        # 把服务器侧两个模型搬到设备上
+        self.server_model.to(self.device)
+        self.global_classifier.to(self.device)
+
+        self.use_amp = bool(use_amp and self.device.type == "cuda")
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+
         self.client_models = {}
         self.cluster_map = {}
         self.cluster_server_models = {}
         self.cluster_global_classifiers = {}
+
+        from utils.tierhfl_aggregator import LayeredAggregator
+        # 让聚合计算也在相同 device 上做（减少 CPU<->GPU 拖拽）
+        self.layered_aggregator = LayeredAggregator(device=str(self.device))
+
+        from utils.tierhfl_loss import EnhancedStagedLoss
         self.enhanced_loss = EnhancedStagedLoss()
-        self.layered_aggregator = LayeredAggregator(device="cpu")
 
     def register_client_models(self, client_models_dict):
         self.client_models.update(client_models_dict)
@@ -105,6 +128,7 @@ class EnhancedSerialTrainer:
         self.cluster_map = cluster_map
         self.cluster_server_models = {}
         self.cluster_global_classifiers = {}
+        # 用当前 server/global classifier 的权重作为各簇初值
         for cluster_id in cluster_map.keys():
             self.cluster_server_models[cluster_id] = copy.deepcopy(self.server_model.state_dict())
             self.cluster_global_classifiers[cluster_id] = copy.deepcopy(self.global_classifier.state_dict())
@@ -239,81 +263,51 @@ class EnhancedSerialTrainer:
         
         return train_results, eval_results, shared_states, training_time
 
-    def _train_initial_phase_enhanced(self, client, client_model, server_model, global_classifier, round_idx, total_rounds, diagnostic_monitor=None):
-        import time
-        from torch.nn.utils import clip_grad_norm_
-        from torch.optim.lr_scheduler import CosineAnnealingLR
+    def _train_initial_phase_enhanced(self, client_id, client, server_model, global_classifier, round_idx, diagnostic_monitor=None):
+        self.server_model.load_state_dict(server_model.state_dict())
+        self.global_classifier.load_state_dict(global_classifier.state_dict())
+        self.server_model.eval()
+        self.global_classifier.train()
 
-        start = time.time()
-        client_model.train(); server_model.train(); global_classifier.train()
+        client_model = self.client_models[client_id]
+        client_model.to(self.device)
+        client_model.train()
 
-        # 1) 冻结个性化路径与本地分类头，只训共享干路
-        for n, p in client_model.named_parameters():
-            if 'shared_base' in n:
-                p.requires_grad = True
+        optimizer = torch.optim.SGD(self.global_classifier.parameters(), lr=client.lr, momentum=0.9, weight_decay=5e-4)
+
+        running_loss = 0.0
+        total, correct = 0, 0
+
+        for data, target in client.train_data:
+            data = data.to(self.device, non_blocking=True)
+            target = target.to(self.device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                local_logits, shared_features, _ = client_model(data)
+                server_features = self.server_model(shared_features)
+                global_logits  = self.global_classifier(server_features)
+                total_loss, global_loss, feat_loss = self.enhanced_loss.stage1_loss(
+                    global_logits, target, shared_features=shared_features
+                )
+
+            if self.use_amp:
+                self.scaler.scale(total_loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
             else:
-                p.requires_grad = False
+                total_loss.backward()
+                optimizer.step()
 
-        # 2) 组装参数与优化器/调度器
-        shared_params = [p for n, p in client_model.named_parameters() if p.requires_grad]
-        server_params = list(server_model.parameters())
-        global_params = list(global_classifier.parameters())
+            running_loss += float(total_loss.detach())
+            with torch.no_grad():
+                pred = global_logits.argmax(dim=1)
+                correct += (pred == target).sum().item()
+                total += target.size(0)
 
-        opt_shared = torch.optim.SGD(shared_params, lr=client.lr, momentum=0.9, weight_decay=client.wd)
-        opt_server = torch.optim.SGD(server_params, lr=client.lr, momentum=0.9, weight_decay=client.wd)
-        opt_global = torch.optim.SGD(global_params, lr=client.lr, momentum=0.9, weight_decay=client.wd)
-
-        sch_shared = CosineAnnealingLR(opt_shared, T_max=max(1, client.local_epochs), eta_min=0.0)
-        sch_server = CosineAnnealingLR(opt_server, T_max=max(1, client.local_epochs), eta_min=0.0)
-        sch_global = CosineAnnealingLR(opt_global, T_max=max(1, client.local_epochs), eta_min=0.0)
-
-        stat = {'loss': 0.0, 'batch_count': 0, 'correct': 0, 'total': 0}
-
-        for _ in range(client.local_epochs):
-            for data, target in client.train_data:
-                data, target = data.to(self.device), target.to(self.device)
-
-                opt_shared.zero_grad(); opt_server.zero_grad(); opt_global.zero_grad()
-
-                # 前向：客户端得到 shared_features，服务器抽取 server_features，全局分类器输出 logits
-                with torch.set_grad_enabled(True):
-                    local_logits, shared_features, _ = client_model(data)   # local_logits 此阶段不用
-                    server_features = server_model(shared_features)
-                    global_logits = global_classifier(server_features)
-
-                    total_loss, global_loss, feat_import_loss = self.enhanced_loss.stage1_loss(
-                        global_logits, target, shared_features=shared_features
-                    )
-
-                    total_loss.backward()
-
-                    # 梯度裁剪：分别对各自参数裁剪
-                    clip_grad_norm_(shared_params, max_norm=1.0)
-                    clip_grad_norm_(server_params, max_norm=1.0)
-                    clip_grad_norm_(global_params, max_norm=1.0)
-
-                    opt_shared.step(); opt_server.step(); opt_global.step()
-
-                # 统计
-                stat['loss'] += float(total_loss.item()); stat['batch_count'] += 1
-                with torch.no_grad():
-                    pred = global_logits.argmax(dim=1)
-                    stat['correct'] += (pred == target).sum().item()
-                    stat['total'] += target.size(0)
-
-            sch_shared.step(); sch_server.step(); sch_global.step()
-
-        # 训练完毕，解冻以便后续阶段使用
-        for p in client_model.parameters(): p.requires_grad = True
-
-        avg_loss = stat['loss'] / max(1, stat['batch_count'])
-        acc = 100.0 * stat['correct'] / max(1, stat['total'])
-
-        return {
-            'train_loss': avg_loss,
-            'global_accuracy': acc,
-            'time_cost': time.time() - start,
-        }
+        train_acc = 100.0 * correct / max(1, total)
+        return {"train_loss": running_loss / max(1, len(client.train_data)), "train_acc": train_acc}
 
 
     def _train_alternating_phase_enhanced(self, client, client_model, server_model, global_classifier,
@@ -565,33 +559,6 @@ class EnhancedSerialTrainer:
             'time_cost': time.time() - start_time
         }
 
-    def _train_personal_path_enhanced(self, client, client_model, round_idx, total_rounds, diagnostic_monitor=None):
-        start = time.time()
-        client_model.train()
-        for n, p in client_model.named_parameters():
-            if 'shared_base' in n:
-                p.requires_grad = False
-            else:
-                p.requires_grad = True
-        opt_personal = torch.optim.Adam([p for n, p in client_model.named_parameters() if p.requires_grad], lr=client.lr)
-        stat = {'local_loss':0.0,'correct':0,'total':0,'batch_count':0}
-        for _ in range(client.local_epochs):
-            for data, target in client.train_data:
-                data, target = data.to(self.device), target.to(self.device)
-                opt_personal.zero_grad()
-                local_logits, shared_f, personal_f = client_model(data)
-                loss = F.cross_entropy(local_logits, target)
-                loss.backward()
-                opt_personal.step()
-                stat['local_loss'] += loss.item(); stat['batch_count'] += 1
-                _, pred = local_logits.max(1)
-                stat['correct'] += pred.eq(target).sum().item(); stat['total'] += target.size(0)
-        for p in client_model.parameters():
-            p.requires_grad = True
-        avg_local = stat['local_loss']/max(1,stat['batch_count'])
-        acc_local = 100.0 * stat['correct']/max(1,stat['total'])
-        return {'local_loss': avg_local, 'local_accuracy': acc_local, 'time_cost': time.time()-start}
-
     def _evaluate_client(self, client, client_model, server_model, classifier):
         """评估客户端模型"""
         # 设置评估模式
@@ -739,6 +706,15 @@ def parse_arguments():
     parser.add_argument('--init_alpha', default=0.6, type=float, help='初始本地与全局损失平衡因子')
     parser.add_argument('--init_lambda', default=0.15, type=float, help='初始特征对齐损失权重')
     parser.add_argument('--beta', default=0.3, type=float, help='聚合动量因子')
+
+    parser.add_argument("--device", type=str, default="auto",
+                    choices=["auto", "cuda", "cpu", "mps"],
+                    help="auto 优先 cuda，其次 mps，最后 cpu")
+    parser.add_argument("--amp", action="store_true",
+                        help="启用混合精度（仅在 cuda 时生效）")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader 的工作进程数（Kaggle 推荐 2~4）")
+
     
     args = parser.parse_args()
     return args
@@ -751,7 +727,7 @@ def setup_wandb(args):
             mode="offline",
             project="TierHFL_Enhanced",
             name=args.running_name,
-            config=args,
+            config=vars(args),
             tags=[f"model_{args.model}", f"dataset_{args.dataset}",
                   f"clients_{args.client_number}", f"partition_{args.partition_method}"],
             group=f"{args.model}_{args.dataset}"
@@ -935,7 +911,7 @@ def load_global_test_set(args):
         return test_loader
     else:
         # 默认返回CIFAR10
-        return load_global_test_set_cifar10(args)
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
 
 def evaluate_global_model(client_model, server_model, global_classifier, global_test_loader, device):
     """评估全局模型在全局测试集上的性能 - 修复版"""
@@ -1116,9 +1092,23 @@ def main():
 
     logger.info("初始化TierHFL: 增强版本 - 集成梯度投影和分层聚合")
 
-    # 设备固定 CPU
-    device = torch.device('cpu')
-    logger.info(f"默认设备: {device}")
+    # 设备
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True  # 提升卷积性能
+    logging.info(f"使用设备: {device}")
+
+    pin_mem = (str(device) == "cuda")
+
     
     # 加载数据集
     logger.info(f"加载数据集: {args.dataset}")
@@ -1142,22 +1132,43 @@ def main():
     logger.info("创建客户端管理器...")
     client_manager = TierHFLClientManager()
     
-    # 注册客户端
+    # === [MARK-CLIENT-DATALOADERS] 每个客户端先建 DataLoader 再注册 ===
+    from torch.utils.data import DataLoader
+
     for client_id in range(args.client_number):
         resource = client_resources[client_id]
         tier = resource["tier"]
-        
-        # 创建客户端
+
+        # 1) 为该客户端构建本地 DataLoader（关键：num_workers / pin_memory）
+        train_loader = DataLoader(
+            train_data_local_dict[client_id],
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=pin_mem,
+            drop_last=True
+        )
+        test_loader = DataLoader(
+            test_data_local_dict[client_id],
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=pin_mem
+        )
+
+        # 2) 把 DataLoader 传给客户端管理器
         client = client_manager.add_client(
             client_id=client_id,
             tier=tier,
-            train_data=train_data_local_dict[client_id],
-            test_data=test_data_local_dict[client_id],
+            train_data=train_loader,
+            test_data=test_loader,
             device=device,
             lr=args.lr,
             local_epochs=args.client_epoch
         )
         client.wd = args.wd
+    # === [MARK-CLIENT-DATALOADERS] END ===
+
 
 
     # 确定输入通道数
@@ -1208,8 +1219,10 @@ def main():
         client_manager=client_manager,
         server_model=server_model,
         global_classifier=global_classifier,
-        device=device
+        device=str(device),
+        use_amp=args.amp
     )
+
     
     # 注册客户端模型
     trainer.register_client_models(client_models)

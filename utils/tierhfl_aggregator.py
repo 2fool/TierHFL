@@ -2,7 +2,7 @@ import torch
 
 class LayeredAggregator:
     def __init__(self, device="cpu"):
-        self.device = torch.device("cpu")
+        self.device = torch.device(device)
         self.server_momentum = {}
         self.classifier_momentum = {}
 

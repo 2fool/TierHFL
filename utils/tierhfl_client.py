@@ -104,6 +104,9 @@ class TierHFLClient:
         self.tier = tier
         self.train_data = train_data
         self.test_data = test_data
+        # [MARK-CLIENT-DEVICE] normalize device
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
         self.device = device
         self.lr = lr
         self.local_epochs = local_epochs
@@ -263,7 +266,8 @@ class TierHFLClient:
         with torch.no_grad():
             for data, target in self.test_data:
                 # 移到设备 - 添加 non_blocking=True
-                data = data.to(self.device, non_blocking=True)
+                # [MARK-NONBLOCK-EVAL]
+                data   = data.to(self.device, non_blocking=True)
                 target = target.to(self.device, non_blocking=True)
                 
                 # 前向传播 - 添加 AMP 支持
