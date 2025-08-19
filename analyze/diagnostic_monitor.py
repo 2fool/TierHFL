@@ -205,14 +205,17 @@ class EnhancedTierHFLDiagnosticMonitor:
         """检测分类器崩溃"""
         try:
             with torch.no_grad():
-                # 计算预测分布
+                # 计算预测分布 - 动态获取类别数
                 _, predictions = torch.max(logits, dim=1)
-                pred_counts = torch.bincount(predictions, minlength=10)
+                # 从logits维度或targets最大值获取类别数
+                num_classes = max(logits.shape[1] if len(logits.shape) > 1 else 10, 
+                                int(targets.max().item()) + 1 if len(targets) > 0 else 10)
+                pred_counts = torch.bincount(predictions, minlength=num_classes)
                 pred_distribution = pred_counts.float() / pred_counts.sum()
                 
                 # 计算熵（多样性指标）
                 entropy = -torch.sum(pred_distribution * torch.log(pred_distribution + 1e-8)).item()
-                max_entropy = np.log(10)  # 10个类别的最大熵
+                max_entropy = np.log(num_classes)  # 使用动态类别数计算最大熵
                 normalized_entropy = entropy / max_entropy
                 
                 # 检测崩溃模式

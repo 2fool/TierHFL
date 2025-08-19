@@ -148,7 +148,7 @@ class EnhancedSerialTrainer:
             self.cluster_server_models[cluster_id] = copy.deepcopy(self.server_model.state_dict())
             self.cluster_global_classifiers[cluster_id] = copy.deepcopy(self.global_classifier.state_dict())
     
-    def execute_round(self, round_idx, total_rounds, diagnostic_monitor=None):
+    def execute_round(self, round_idx, total_rounds, args, diagnostic_monitor=None):
         """执行一轮训练 - 集成增强版监控和综合分析"""
         start_time = time.time()
         
@@ -167,11 +167,11 @@ class EnhancedSerialTrainer:
         eval_results = {}
         shared_states = {}
         
-        # 确定当前训练阶段
-        if round_idx < 10:
+        # 确定当前训练阶段 - 使用参数化边界而非硬编码
+        if round_idx < args.initial_phase_rounds:
             training_phase = "initial"
             logging.info(f"轮次 {round_idx+1}/{total_rounds} - 初始特征学习阶段")
-        elif round_idx < 80:
+        elif round_idx < args.initial_phase_rounds + args.alternating_phase_rounds:
             training_phase = "alternating"
             logging.info(f"轮次 {round_idx+1}/{total_rounds} - 交替训练阶段")
         else:
@@ -1459,6 +1459,7 @@ def main():
         train_results, eval_results, shared_states, training_time = trainer.execute_round(
             round_idx=round_idx, 
             total_rounds=args.rounds,
+            args=args,
             diagnostic_monitor=diagnostic_monitor
         )
         
