@@ -203,8 +203,15 @@ class EnhancedSerialTrainer:
                 # 根据训练阶段执行训练
                 if training_phase == "initial":
                     train_result = self._train_initial_phase_enhanced(
-                        client, client_model, cluster_server, cluster_classifier, 
-                        round_idx, total_rounds, diagnostic_monitor)
+                        client,
+                        client_model,
+                        cluster_server,      # 或者你的变量名 server_model
+                        cluster_classifier, # 或者你的变量名 global_classifier
+                        round_idx,
+                        total_rounds,
+                        diagnostic_monitor
+                    )
+
                     
                 elif training_phase == "alternating":
                     train_result = self._train_alternating_phase_enhanced(
@@ -263,39 +270,82 @@ class EnhancedSerialTrainer:
         
         return train_results, eval_results, shared_states, training_time
 
-    def _train_initial_phase_enhanced(self, client_id, client, server_model, global_classifier, round_idx, diagnostic_monitor=None):
-        self.server_model.load_state_dict(server_model.state_dict())
-        self.global_classifier.load_state_dict(global_classifier.state_dict())
-        self.server_model.eval()
-        self.global_classifier.train()
+    # === 阶段1：仅训练“全局路径”（服务器特征 + 全局分类器）===
+    # 在 class EnhancedSerialTrainer 内部，完整替换这个函数
+    def _train_initial_phase_enhanced(self,
+                                    client,
+                                    client_model,
+                                    server_model,
+                                    global_classifier,
+                                    round_idx,
+                                    total_rounds,
+                                    diagnostic_monitor=None):
+        """
+        阶段1（初始化特征学习）：
+        与 execute_round(...) 的调用保持一致：
+        (client, client_model, server_model, global_classifier, round_idx, total_rounds, diagnostic_monitor)
+        仅优化全局分类器，不更新客户端模型；客户端负责产出共享特征 -> 服务器继续提取 -> 全局分类器计算损失。
+        """
+        import torch
+        import torch.nn.functional as F
 
-        client_model = self.client_models[client_id]
-        client_model.to(self.device)
-        client_model.train()
+        device = self.device
+        use_amp = bool(getattr(self, "use_amp", False))
+        scaler  = getattr(self, "scaler", None)
 
-        optimizer = torch.optim.SGD(self.global_classifier.parameters(), lr=client.lr, momentum=0.9, weight_decay=5e-4)
+        # 同步/挂接：把传入的 server / classifier 状态装载到训练器持有的对象
+        if hasattr(self, "server_model") and self.server_model is not server_model:
+            self.server_model.load_state_dict(server_model.state_dict())
+        else:
+            self.server_model = server_model
+
+        if hasattr(self, "global_classifier") and self.global_classifier is not global_classifier:
+            self.global_classifier.load_state_dict(global_classifier.state_dict())
+        else:
+            self.global_classifier = global_classifier
+
+        # 设定模式与设备
+        self.server_model.to(device).eval()
+        self.global_classifier.to(device).train()
+        client_model.to(device).train()
+
+        # 阶段1：只优化全局分类器（不动客户端）
+        optimizer = torch.optim.SGD(
+            self.global_classifier.parameters(),
+            lr=getattr(client, "lr", 0.05),
+            momentum=0.9,
+            weight_decay=getattr(client, "wd", 5e-4),
+        )
 
         running_loss = 0.0
         total, correct = 0, 0
 
         for data, target in client.train_data:
-            data = data.to(self.device, non_blocking=True)
-            target = target.to(self.device, non_blocking=True)
+            data   = data.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                # 客户端前向 -> 共享特征
                 local_logits, shared_features, _ = client_model(data)
+                # 服务器继续提特征
                 server_features = self.server_model(shared_features)
+                # 全局分类器输出
                 global_logits  = self.global_classifier(server_features)
-                total_loss, global_loss, feat_loss = self.enhanced_loss.stage1_loss(
-                    global_logits, target, shared_features=shared_features
-                )
 
-            if self.use_amp:
-                self.scaler.scale(total_loss).backward()
-                self.scaler.step(optimizer)
-                self.scaler.update()
+                # 阶段1损失（如有增强损失就用，没有就用 CE）
+                if hasattr(self, "enhanced_loss") and hasattr(self.enhanced_loss, "stage1_loss"):
+                    total_loss, _, _ = self.enhanced_loss.stage1_loss(
+                        global_logits, target, shared_features=shared_features
+                    )
+                else:
+                    total_loss = F.cross_entropy(global_logits, target)
+
+            if use_amp and scaler is not None:
+                scaler.scale(total_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
             else:
                 total_loss.backward()
                 optimizer.step()
@@ -304,100 +354,292 @@ class EnhancedSerialTrainer:
             with torch.no_grad():
                 pred = global_logits.argmax(dim=1)
                 correct += (pred == target).sum().item()
-                total += target.size(0)
+                total   += target.size(0)
 
+        avg_loss  = running_loss / max(1, len(client.train_data))
         train_acc = 100.0 * correct / max(1, total)
-        return {"train_loss": running_loss / max(1, len(client.train_data)), "train_acc": train_acc}
 
+        # 可选：把阶段1训练指标交给诊断器
+        if diagnostic_monitor is not None and hasattr(diagnostic_monitor, "log_client_round") and hasattr(client, "client_id"):
+            diagnostic_monitor.log_client_round(client.client_id, round_idx, {
+                "stage": "init", "loss": avg_loss, "acc": train_acc
+            })
 
-    def _train_alternating_phase_enhanced(self, client, client_model, server_model, global_classifier,
-                                    round_idx, total_rounds, diagnostic_monitor=None, alpha=0.5):
+        return {"train_loss": avg_loss, "train_acc": train_acc}
+
+    def _train_alternating_phase_enhanced(self,
+                                      client,
+                                      client_model,
+                                      server_model,
+                                      global_classifier,
+                                      round_idx,
+                                      total_rounds,
+                                      diagnostic_monitor=None):
+        """
+        阶段2：交替训练（共享+个性化+服务器+全局头一起参与，损失按 alpha 加权）
+        调用签名需与 execute_round 保持一致。
+        """
         import time
+        import torch
+        import torch.nn.functional as F
         from torch.nn.utils import clip_grad_norm_
         from torch.optim.lr_scheduler import CosineAnnealingLR
 
-        start = time.time()
-        client_model.train(); server_model.train(); global_classifier.train()
+        device  = self.device
+        use_amp = bool(getattr(self, "use_amp", False))
+        scaler  = getattr(self, "scaler", None)
 
-        # 1) 所有分支均可训练（共享 + 个性化 + 本地头 + 服务器 + 全局头）
-        for p in client_model.parameters(): p.requires_grad = True
+        start_time = time.time()
 
-        # 2) 分别建立优化器与调度器
-        shared_params = [p for n, p in client_model.named_parameters() if ('shared_base' in n and p.requires_grad)]
+        # 模式
+        client_model.to(device).train()
+        server_model.to(device).train()
+        global_classifier.to(device).train()
+
+        # 允许所有参数可训练
+        for p in client_model.parameters():
+            p.requires_grad = True
+
+        # 参数分组
+        shared_params   = [p for n, p in client_model.named_parameters() if ('shared_base' in n and p.requires_grad)]
         personal_params = [p for n, p in client_model.named_parameters() if ('shared_base' not in n and p.requires_grad)]
-        server_params = list(server_model.parameters())
-        global_params = list(global_classifier.parameters())
+        server_params   = list(server_model.parameters())
+        global_params   = list(global_classifier.parameters())
 
-        # 可按需使用不同优化器；这里统一用 SGD 保持稳定（也可把个性化改为 Adam）
-        opt_shared  = torch.optim.SGD(shared_params,   lr=client.lr, momentum=0.9, weight_decay=client.wd) if shared_params else None
-        opt_personal= torch.optim.SGD(personal_params, lr=client.lr, momentum=0.9, weight_decay=client.wd) if personal_params else None
-        opt_server  = torch.optim.SGD(server_params,   lr=client.lr, momentum=0.9, weight_decay=client.wd)
-        opt_global  = torch.optim.SGD(global_params,   lr=client.lr, momentum=0.9, weight_decay=client.wd)
+        lr = float(getattr(client, "lr", 0.05))
+        wd = float(getattr(client, "wd", 5e-4))
 
-        sch_shared   = CosineAnnealingLR(opt_shared,  T_max=max(1, client.local_epochs), eta_min=0.0) if opt_shared else None
-        sch_personal = CosineAnnealingLR(opt_personal,T_max=max(1, client.local_epochs), eta_min=0.0) if opt_personal else None
-        sch_server   = CosineAnnealingLR(opt_server,  T_max=max(1, client.local_epochs), eta_min=0.0)
-        sch_global   = CosineAnnealingLR(opt_global,  T_max=max(1, client.local_epochs), eta_min=0.0)
+        # 优化器（稳定起见全部 SGD；如需更快收敛可将 personal_params 改为 Adam）
+        opt_shared    = torch.optim.SGD(shared_params,   lr=lr, momentum=0.9, weight_decay=wd) if shared_params else None
+        opt_personal  = torch.optim.SGD(personal_params, lr=lr, momentum=0.9, weight_decay=wd) if personal_params else None
+        opt_server    = torch.optim.SGD(server_params,   lr=lr, momentum=0.9, weight_decay=wd)
+        opt_global    = torch.optim.SGD(global_params,   lr=lr, momentum=0.9, weight_decay=wd)
 
-        stat = {'total_loss': 0.0, 'batch_count': 0, 'local_correct': 0, 'global_correct': 0, 'total': 0}
+        # 轻量调度
+        T = max(1, int(getattr(client, "local_epochs", 1)))
+        sch_shared   = CosineAnnealingLR(opt_shared,   T_max=T, eta_min=0.0) if opt_shared else None
+        sch_personal = CosineAnnealingLR(opt_personal, T_max=T, eta_min=0.0) if opt_personal else None
+        sch_server   = CosineAnnealingLR(opt_server,   T_max=T, eta_min=0.0)
+        sch_global   = CosineAnnealingLR(opt_global,   T_max=T, eta_min=0.0)
 
-        for _ in range(client.local_epochs):
+        # 进度自适应的损失权重：早期更偏本地，后期更偏全局
+        progress = float(round_idx) / max(1.0, float(total_rounds))
+        alpha = 0.6 - 0.4 * progress            # ∈ [0.2, 0.6]
+        alpha = float(max(0.1, min(0.9, alpha))) # 夹住范围
+
+        stats = {'total_loss': 0.0, 'batch_count': 0, 'local_correct': 0, 'global_correct': 0, 'total': 0}
+
+        for _ in range(int(getattr(client, "local_epochs", 1))):
             for data, target in client.train_data:
-                data, target = data.to(self.device), target.to(self.device)
+                data   = data.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
 
-                if opt_shared: opt_shared.zero_grad()
-                if opt_personal: opt_personal.zero_grad()
-                opt_server.zero_grad(); opt_global.zero_grad()
+                if opt_shared:   opt_shared.zero_grad(set_to_none=True)
+                if opt_personal: opt_personal.zero_grad(set_to_none=True)
+                opt_server.zero_grad(set_to_none=True)
+                opt_global.zero_grad(set_to_none=True)
 
-                with torch.set_grad_enabled(True):
+                with torch.cuda.amp.autocast(enabled=use_amp):
                     local_logits, shared_features, personal_features = client_model(data)
                     server_features = server_model(shared_features)
-                    global_logits = global_classifier(server_features)
+                    global_logits   = global_classifier(server_features)
 
-                    total_loss, local_loss, global_loss, balance_loss = self.enhanced_loss.stage2_3_loss(
-                        local_logits, global_logits, target,
-                        personal_gradients=None, global_gradients=None,
-                        shared_features=shared_features, alpha=alpha
-                    )
+                    if hasattr(self, "enhanced_loss") and hasattr(self.enhanced_loss, "stage2_3_loss"):
+                        total_loss, local_loss, global_loss, balance_loss = self.enhanced_loss.stage2_3_loss(
+                            local_logits, global_logits, target,
+                            personal_gradients=None, global_gradients=None,
+                            shared_features=shared_features, alpha=alpha
+                        )
+                    else:
+                        # 回退到简单的加权 CE
+                        local_ce  = F.cross_entropy(local_logits,  target)
+                        global_ce = F.cross_entropy(global_logits, target)
+                        total_loss = alpha * local_ce + (1.0 - alpha) * global_ce
 
-                    total_loss.backward()
+                # （可选）共享层梯度冲突投影
+                if hasattr(self, "enhanced_loss") and hasattr(self.enhanced_loss, "apply_gradient_projection"):
+                    try:
+                        self.enhanced_loss.apply_gradient_projection(client_model, local_loss, global_loss, alpha_stage=alpha)
+                    except Exception:
+                        pass
 
-                    # （可选）在共享层上做梯度投影，缓解两路冲突
-                    # self.enhanced_loss.apply_gradient_projection(client_model, local_loss, global_loss, alpha_stage=alpha)
-
+                # 反传 + 更新（支持 AMP）
+                if use_amp and scaler is not None:
+                    scaler.scale(total_loss).backward()
                     # 梯度裁剪
                     if shared_params:   clip_grad_norm_(shared_params,   max_norm=1.0)
                     if personal_params: clip_grad_norm_(personal_params, max_norm=1.0)
                     clip_grad_norm_(server_params,   max_norm=1.0)
                     clip_grad_norm_(global_params,   max_norm=1.0)
 
-                    # 参数更新
+                    if opt_shared:   scaler.step(opt_shared)
+                    if opt_personal: scaler.step(opt_personal)
+                    scaler.step(opt_server)
+                    scaler.step(opt_global)
+                    scaler.update()
+                else:
+                    total_loss.backward()
+                    if shared_params:   clip_grad_norm_(shared_params,   max_norm=1.0)
+                    if personal_params: clip_grad_norm_(personal_params, max_norm=1.0)
+                    clip_grad_norm_(server_params,   max_norm=1.0)
+                    clip_grad_norm_(global_params,   max_norm=1.0)
+
                     if opt_shared:   opt_shared.step()
                     if opt_personal: opt_personal.step()
-                    opt_server.step(); opt_global.step()
+                    opt_server.step()
+                    opt_global.step()
 
                 # 统计
-                stat['total_loss'] += float(total_loss.item()); stat['batch_count'] += 1
+                stats['total_loss']  += float(total_loss.detach())
+                stats['batch_count'] += 1
                 with torch.no_grad():
-                    stat['local_correct']  += (local_logits.argmax(dim=1)  == target).sum().item()
-                    stat['global_correct'] += (global_logits.argmax(dim=1) == target).sum().item()
-                    stat['total']          += target.size(0)
+                    stats['local_correct']  += (local_logits.argmax(1)  == target).sum().item()
+                    stats['global_correct'] += (global_logits.argmax(1) == target).sum().item()
+                    stats['total']          += target.size(0)
 
-            # 调度器 step
             if sch_shared:   sch_shared.step()
             if sch_personal: sch_personal.step()
-            sch_server.step(); sch_global.step()
+            sch_server.step()
+            sch_global.step()
 
-        avg_loss = stat['total_loss'] / max(1, stat['batch_count'])
-        acc_local  = 100.0 * stat['local_correct']  / max(1, stat['total'])
-        acc_global = 100.0 * stat['global_correct'] / max(1, stat['total'])
+        avg_loss   = stats['total_loss'] / max(1, stats['batch_count'])
+        acc_local  = 100.0 * stats['local_correct']  / max(1, stats['total'])
+        acc_global = 100.0 * stats['global_correct'] / max(1, stats['total'])
+
+        if diagnostic_monitor is not None and hasattr(diagnostic_monitor, "log_client_round") and hasattr(client, "client_id"):
+            diagnostic_monitor.log_client_round(client.client_id, round_idx, {
+                "stage": "alt", "loss": avg_loss, "acc_local": acc_local, "acc_global": acc_global, "alpha": alpha
+            })
 
         return {
             'train_loss': avg_loss,
             'local_accuracy': acc_local,
             'global_accuracy': acc_global,
-            'time_cost': time.time() - start,
+            'time_cost': time.time() - start_time,
         }
+
+
+    
+    
+    def _train_fine_tuning_phase_enhanced(self,
+                                      client,
+                                      client_model,
+                                      server_model,
+                                      global_classifier,
+                                      round_idx,
+                                      total_rounds,
+                                      diagnostic_monitor=None):
+        """
+        阶段3：精细微调（冻结共享与服务器，仅微调个性化分支 + 本地头；全局头小步跟随）
+        调用签名需与 execute_round 保持一致。
+        """
+        import time
+        import torch
+        import torch.nn.functional as F
+        from torch.nn.utils import clip_grad_norm_
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+
+        device  = self.device
+        use_amp = bool(getattr(self, "use_amp", False))
+        scaler  = getattr(self, "scaler", None)
+
+        start_time = time.time()
+
+        # 模式
+        client_model.to(device).train()
+        server_model.to(device).eval()          # 冻结服务器
+        global_classifier.to(device).train()    # 轻微跟随
+
+        # 冻结共享层
+        for n, p in client_model.named_parameters():
+            if 'shared_base' in n:
+                p.requires_grad = False
+            else:
+                p.requires_grad = True
+
+        # 只微调个性化 & 本地头；全局头降低 LR 跟随
+        personal_params = [p for n, p in client_model.named_parameters() if p.requires_grad]
+        global_params   = list(global_classifier.parameters())
+
+        base_lr   = float(getattr(client, "lr", 0.05))
+        small_lr  = base_lr * 0.2
+        wd        = float(getattr(client, "wd", 5e-4))
+        epochs    = int(getattr(client, "local_epochs", 1))
+
+        opt_client = torch.optim.SGD(personal_params, lr=base_lr,  momentum=0.9, weight_decay=wd) if personal_params else None
+        opt_global = torch.optim.SGD(global_params,   lr=small_lr, momentum=0.9, weight_decay=wd)
+
+        sch_client = CosineAnnealingLR(opt_client, T_max=max(1, epochs), eta_min=0.0) if opt_client else None
+        sch_global = CosineAnnealingLR(opt_global, T_max=max(1, epochs), eta_min=0.0)
+
+        stats = {'total_loss': 0.0, 'batch_count': 0, 'local_correct': 0, 'global_correct': 0, 'total': 0}
+
+        # 精调期：更偏本地
+        progress = float(round_idx) / max(1.0, float(total_rounds))
+        alpha = float(max(0.6, min(0.95, 0.8 + 0.2 * progress)))   # ∈ [0.8, 1.0) 偏向 local
+
+        for _ in range(epochs):
+            for data, target in client.train_data:
+                data   = data.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+
+                if opt_client: opt_client.zero_grad(set_to_none=True)
+                opt_global.zero_grad(set_to_none=True)
+
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    local_logits, shared_features, personal_features = client_model(data)
+                    # 服务器 & 全局头仍用于蒸馏/正则（不更新 server）
+                    with torch.no_grad():
+                        server_features = server_model(shared_features)
+                    global_logits = global_classifier(server_features)
+
+                    # 以本地 CE 为主，辅以少量全局 CE 正则
+                    local_ce  = F.cross_entropy(local_logits,  target)
+                    global_ce = F.cross_entropy(global_logits, target)
+                    total_loss = alpha * local_ce + (1.0 - alpha) * global_ce
+
+                if use_amp and scaler is not None:
+                    scaler.scale(total_loss).backward()
+                    if personal_params: clip_grad_norm_(personal_params, max_norm=1.0)
+                    clip_grad_norm_(global_params,   max_norm=1.0)
+                    if opt_client: scaler.step(opt_client)
+                    scaler.step(opt_global)
+                    scaler.update()
+                else:
+                    total_loss.backward()
+                    if personal_params: clip_grad_norm_(personal_params, max_norm=1.0)
+                    clip_grad_norm_(global_params,   max_norm=1.0)
+                    if opt_client: opt_client.step()
+                    opt_global.step()
+
+                stats['total_loss']  += float(total_loss.detach())
+                stats['batch_count'] += 1
+                with torch.no_grad():
+                    stats['local_correct']  += (local_logits.argmax(1)  == target).sum().item()
+                    stats['global_correct'] += (global_logits.argmax(1) == target).sum().item()
+                    stats['total']          += target.size(0)
+
+            if sch_client: sch_client.step()
+            sch_global.step()
+
+        avg_loss   = stats['total_loss'] / max(1, stats['batch_count'])
+        acc_local  = 100.0 * stats['local_correct']  / max(1, stats['total'])
+        acc_global = 100.0 * stats['global_correct'] / max(1, stats['total'])
+
+        if diagnostic_monitor is not None and hasattr(diagnostic_monitor, "log_client_round") and hasattr(client, "client_id"):
+            diagnostic_monitor.log_client_round(client.client_id, round_idx, {
+                "stage": "finetune", "loss": avg_loss, "acc_local": acc_local, "acc_global": acc_global, "alpha": alpha
+            })
+
+        return {
+            'train_loss': avg_loss,
+            'local_accuracy': acc_local,
+            'global_accuracy': acc_global,
+            'time_cost': time.time() - start_time,
+        }
+
+
+
 
 
     def _train_personal_path_enhanced(self, client, client_model, round_idx, total_rounds, diagnostic_monitor=None):

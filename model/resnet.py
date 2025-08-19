@@ -120,7 +120,7 @@ class TierAwareClientModel(nn.Module):
             if isinstance(m, nn.Conv2d):
                 # Some torch versions don't support gain('gelu'); fallback to 'relu'
                 try:
-                    nn.init.kaiming_normal_(m.weight, nonlinearity='gelu')
+                    nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 except ValueError:
                     nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
             elif isinstance(m, nn.Linear):
@@ -167,7 +167,7 @@ class EnhancedServerModel(nn.Module):
             if isinstance(m, nn.Conv2d):
                 # Same fallback for older torch
                 try:
-                    nn.init.kaiming_normal_(m.weight, nonlinearity='gelu')
+                    nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 except ValueError:
                     nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
             elif isinstance(m, nn.Linear):
