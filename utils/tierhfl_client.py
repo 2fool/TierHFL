@@ -128,7 +128,7 @@ class TierHFLClient:
         self.lambda_feature = 0.1  # 特征对齐损失权重
         
         # AMP 支持
-        self.use_amp = (str(device) == "cuda")
+        self.use_amp = (isinstance(device, torch.device) and device.type == "cuda")
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp) if self.use_amp else None
     
     def update_learning_rate(self, lr_factor=0.85):

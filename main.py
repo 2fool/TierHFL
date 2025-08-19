@@ -19,26 +19,16 @@ import math
 # 忽略警告
 warnings.filterwarnings("ignore")
 
-# 添加项目根目录到系统路径
-sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "../")))
+# 添加当前目录到sys.path以支持扁平导入
+sys.path.insert(0, os.path.abspath(os.getcwd()))
 
-# 导入自定义模块，包括新的增强损失函数和分层聚合器
-from model.resnet import EnhancedServerModel, TierAwareClientModel, ImprovedGlobalClassifier
-from utils.tierhfl_aggregator import LayeredAggregator
-from utils.tierhfl_client import TierHFLClientManager
-from utils.tierhfl_loss import EnhancedStagedLoss
-
-from analyze.tierhfl_analyze import validate_server_effectiveness
-
-
-# 导入数据加载和处理模块
-from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar10
-from api.data_preprocessing.cifar100.data_loader import load_partition_data_cifar100
-from api.data_preprocessing.cinic10.data_loader import load_partition_data_cinic10
-# 导入新的Fashion-MNIST数据加载器
-from api.data_preprocessing.fashion_mnist.data_loader import load_partition_data_fashion_mnist
-# 导入监控器
-from analyze.diagnostic_monitor import EnhancedTierHFLDiagnosticMonitor
+# 扁平导入自定义模块
+from resnet import EnhancedServerModel, TierAwareClientModel, ImprovedGlobalClassifier
+from tierhfl_aggregator import LayeredAggregator
+from tierhfl_client import TierHFLClientManager
+from tierhfl_loss import EnhancedStagedLoss
+from tierhfl_analyze import validate_server_effectiveness
+from diagnostic_monitor import EnhancedTierHFLDiagnosticMonitor
 
 # === logging setup (放在 main.py 的 import 之后) ===
 import logging, sys
@@ -119,7 +109,10 @@ class EnhancedSerialTrainer:
         self.layered_aggregator = LayeredAggregator(device=str(self.device))
 
         from utils.tierhfl_loss import EnhancedStagedLoss
-        self.enhanced_loss = EnhancedStagedLoss()
+        self.enhanced_loss = EnhancedStagedLoss(
+            ls_eps=0.05,       # 降低标签平滑，减少小类信息被抹平
+            entropy_coeff=2e-3  # 增强全局头的输出熵约束，防止单类偏好
+        )
 
     def _prepare_models_for_round(self, server_model, global_classifier):
         """本轮只调用一次，把聚合后的权重复制到trainer持有的模型上"""
@@ -689,10 +682,10 @@ class EnhancedSerialTrainer:
         }
 
     def _evaluate_client(self, client, client_model, server_model, global_classifier):
-        # 不再load_state_dict —— 权重已经在聚类开始时统一加载过了
+        # 使用传入的参数而非self的模型，确保聚类专属模型被正确使用
         client_model.eval()
-        self.server_model.eval()
-        self.global_classifier.eval()
+        server_model.eval()
+        global_classifier.eval()
 
         # 关键：解包 DataLoader
         test_loader = self._unwrap_loader(client.test_data)
@@ -706,8 +699,8 @@ class EnhancedSerialTrainer:
                 target = target.to(self.device, non_blocking=True)
 
                 local_logits, shared_features, _ = client_model(data)
-                server_features = self.server_model(shared_features)
-                global_logits   = self.global_classifier(server_features)
+                server_features = server_model(shared_features)            # 使用传入的参数
+                global_logits   = global_classifier(server_features)       # 使用传入的参数
 
                 loss_sum += F.cross_entropy(global_logits, target, reduction="sum").item()
                 pred_local  = local_logits.argmax(dim=1)
@@ -873,36 +866,93 @@ def setup_wandb(args):
             logger.warning("完全禁用 wandb。")
 
 
-def load_dataset(args):
-    if args.dataset == "cifar10":
-        data_loader = load_partition_data_cifar10
-    elif args.dataset == "cifar100":
-        data_loader = load_partition_data_cifar100
-    elif args.dataset == "fashion_mnist":
-        data_loader = load_partition_data_fashion_mnist
-    elif args.dataset == "cinic10":
-        data_loader = load_partition_data_cinic10
-        args.data_dir = './data/cinic10/'
-    else:
-        data_loader = load_partition_data_cifar10
+# --- Fallback: 本地 Fashion-MNIST 切分为多个客户端的简单实现 ---
+def fallback_load_partition_data_fashion_mnist(dataset, data_dir, partition_method, partition_alpha,
+                                              client_number, batch_size):
+    import torchvision, torchvision.transforms as T
+    from torch.utils.data import DataLoader, Subset
+    import numpy as np
 
-    if args.dataset == "cinic10":
-        train_data_num, test_data_num, train_data_global, test_data_global, \
-        train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
-        class_num, traindata_cls_counts = data_loader(args.dataset, args.data_dir, args.partition_method,
-                                args.partition_alpha, args.client_number, args.batch_size)
-        
-        dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
-                   train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, traindata_cls_counts]
-        
-    else:
-        train_data_num, test_data_num, train_data_global, test_data_global, \
-        train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
-        class_num = data_loader(args.dataset, args.data_dir, args.partition_method,
-                                args.partition_alpha, args.client_number, args.batch_size)
-        
-        dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
-                   train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num]
+    # Kaggle 无网时不要下载
+    transform_train = T.Compose([T.RandomCrop(28, padding=2), T.ToTensor(), T.Normalize([0.2860],[0.3530])])
+    transform_test  = T.Compose([T.ToTensor(), T.Normalize([0.2860],[0.3530])])
+
+    # 尝试不下载；如本地无数据会抛错，再提示用 Kaggle Datasets
+    try:
+        trainset = torchvision.datasets.FashionMNIST(root=data_dir, train=True, download=False, transform=transform_train)
+        testset  = torchvision.datasets.FashionMNIST(root=data_dir, train=False, download=False, transform=transform_test)
+    except Exception:
+        raise RuntimeError("本地未找到 Fashion-MNIST，Kaggle 无网状态请先在右侧 'Add data' 挂载 Fashion-MNIST 数据集或把数据拷到 ./data")
+
+    n = len(trainset)
+    idx = np.arange(n)
+    np.random.shuffle(idx)
+    # 简单均分给各客户端（hetero/alpha 复杂切分此处先省略，能跑为先）
+    splits = np.array_split(idx, client_number)
+
+    train_data_local_dict, test_data_local_dict, train_data_local_num_dict = {}, {}, {}
+    for cid in range(client_number):
+        train_subset = Subset(trainset, splits[cid])
+        train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=False)
+        test_loader  = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=False)
+        train_data_local_dict[cid] = train_loader
+        test_data_local_dict[cid] = test_loader
+        train_data_local_num_dict[cid] = len(train_subset)
+
+    train_data_num = len(trainset); test_data_num = len(testset); class_num = 10
+    train_data_global = None; test_data_global = None
+    return train_data_num, test_data_num, train_data_global, test_data_global, \
+           train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num
+
+def load_dataset(args):
+    try:
+        if args.dataset == "cifar10":
+            from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar10
+            data_loader = load_partition_data_cifar10
+        elif args.dataset == "cifar100":
+            from api.data_preprocessing.cifar100.data_loader import load_partition_data_cifar100
+            data_loader = load_partition_data_cifar100
+        elif args.dataset == "fashion_mnist":
+            from api.data_preprocessing.fashion_mnist.data_loader import load_partition_data_fashion_mnist
+            data_loader = load_partition_data_fashion_mnist
+        elif args.dataset == "cinic10":
+            from api.data_preprocessing.cinic10.data_loader import load_partition_data_cinic10
+            data_loader = load_partition_data_cinic10
+            args.data_dir = './data/cinic10/'
+        else:
+            from api.data_preprocessing.cifar10.data_loader import load_partition_data_cifar10
+            data_loader = load_partition_data_cifar10
+
+        if args.dataset == "cinic10":
+            train_data_num, test_data_num, train_data_global, test_data_global, \
+            train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
+            class_num, traindata_cls_counts = data_loader(args.dataset, args.data_dir, args.partition_method,
+                                    args.partition_alpha, args.client_number, args.batch_size)
+            
+            dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
+                       train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num, traindata_cls_counts]
+            
+        else:
+            train_data_num, test_data_num, train_data_global, test_data_global, \
+            train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
+            class_num = data_loader(args.dataset, args.data_dir, args.partition_method,
+                                    args.partition_alpha, args.client_number, args.batch_size)
+            
+            dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
+                       train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num]
+    
+    except Exception as e:
+        print(f"[WARN] 正式数据加载器不可用，使用 fallback：{e}")
+        if args.dataset == "fashion_mnist":
+            train_data_num, test_data_num, train_data_global, test_data_global, \
+            train_data_local_num_dict, train_data_local_dict, test_data_local_dict, \
+            class_num = fallback_load_partition_data_fashion_mnist(args.dataset, args.data_dir, args.partition_method,
+                                    args.partition_alpha, args.client_number, args.batch_size)
+            
+            dataset = [train_data_num, test_data_num, train_data_global, test_data_global,
+                       train_data_local_num_dict, train_data_local_dict, test_data_local_dict, class_num]
+        else:
+            raise
     
     return dataset
 
@@ -1298,14 +1348,14 @@ def main():
     logger.info("创建服务器特征提取模型...")
     server_model = EnhancedServerModel(
         model_type=args.model,
-        feature_dim=128,
+        feature_dim=256,  # 从128提升到256，提升CIFAR-100表征能力
         input_channels=input_channels  # 添加输入通道参数
     ).to(device)
     
     # 创建全局分类器
     logger.info("创建全局分类器...")
     global_classifier = ImprovedGlobalClassifier(
-        feature_dim=128, 
+        feature_dim=256,  # 从128提升到256，匹配服务器特征维度
         num_classes=class_num
     ).to(device)
     
