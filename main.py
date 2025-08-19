@@ -286,20 +286,23 @@ class EnhancedSerialTrainer:
     # 在 class EnhancedSerialTrainer 内部，完整替换这个函数
     def _train_initial_phase_enhanced(self, client, client_model, server_model, global_classifier,
                                       round_idx, total_rounds, diagnostic_monitor=None):
+        # 同步权重
         self.server_model.load_state_dict(server_model.state_dict())
         self.global_classifier.load_state_dict(global_classifier.state_dict())
+
+        # 关键：统一迁移到同一设备
+        self.server_model.to(self.device)
+        self.global_classifier.to(self.device)
+        client_model.to(self.device)
+
         self.server_model.eval()
         self.global_classifier.train()
-
-        client_model.to(self.device)
         client_model.train()
 
         optimizer = torch.optim.SGD(self.global_classifier.parameters(),
                                     lr=client.lr, momentum=0.9, weight_decay=5e-4)
 
-        running_loss = 0.0
-        total, correct = 0, 0
-
+        running_loss, total, correct = 0.0, 0, 0
         train_loader = self._unwrap_loader(client.train_data)
 
         for data, target in train_loader:
@@ -307,15 +310,15 @@ class EnhancedSerialTrainer:
             target = target.to(self.device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.cuda.amp.autocast(enabled=self.use_amp and torch.cuda.is_available()):
                 local_logits, shared_features, _ = client_model(data)
                 server_features = self.server_model(shared_features)
                 global_logits   = self.global_classifier(server_features)
-                total_loss, global_loss, feat_loss = self.enhanced_loss.stage1_loss(
+                total_loss, _, _ = self.enhanced_loss.stage1_loss(
                     global_logits, target, shared_features=shared_features
                 )
 
-            if self.use_amp:
+            if self.use_amp and torch.cuda.is_available():
                 self.scaler.scale(total_loss).backward()
                 self.scaler.step(optimizer)
                 self.scaler.update()
@@ -329,8 +332,8 @@ class EnhancedSerialTrainer:
                 correct += (pred == target).sum().item()
                 total   += target.size(0)
 
-        train_acc = 100.0 * correct / max(1, total)
-        return {"train_loss": running_loss / max(1, len(train_loader)), "train_acc": train_acc}
+        return {"train_loss": running_loss / max(1, len(train_loader)),
+                "train_acc": 100.0 * correct / max(1, total)}
 
     def _train_alternating_phase_enhanced(self, client, client_model, server_model, classifier,
                                           round_idx, total_rounds, diagnostic_monitor=None):
@@ -338,6 +341,11 @@ class EnhancedSerialTrainer:
         from torch.nn.utils import clip_grad_norm_
         from torch.optim.lr_scheduler import CosineAnnealingLR
         start = time.time()
+
+        # 关键：统一迁移到同一设备
+        client_model.to(self.device)
+        server_model.to(self.device)
+        classifier.to(self.device)
 
         client_model.train(); server_model.train(); classifier.train()
         for p in client_model.parameters(): p.requires_grad = True
@@ -371,7 +379,7 @@ class EnhancedSerialTrainer:
                 if opt_personal: opt_personal.zero_grad()
                 opt_server.zero_grad(); opt_global.zero_grad()
 
-                with torch.set_grad_enabled(True), torch.cuda.amp.autocast(enabled=self.use_amp):
+                with torch.cuda.amp.autocast(enabled=self.use_amp and torch.cuda.is_available()):
                     local_logits, shared_features, personal_features = client_model(data)
                     server_features = server_model(shared_features)
                     global_logits   = classifier(server_features)
@@ -382,7 +390,7 @@ class EnhancedSerialTrainer:
                         shared_features=shared_features, alpha=alpha
                     )
 
-                if self.use_amp:
+                if self.use_amp and torch.cuda.is_available():
                     if opt_shared:   self.scaler.scale(total_loss).backward(retain_graph=False)
                     else:            self.scaler.scale(total_loss).backward()
                     if shared_params:   self.scaler.unscale_(opt_shared)
@@ -398,7 +406,7 @@ class EnhancedSerialTrainer:
                 clip_grad_norm_(global_params,   max_norm=1.0)
 
                 # 更新
-                if self.use_amp:
+                if self.use_amp and torch.cuda.is_available():
                     if opt_shared:   self.scaler.step(opt_shared)
                     if opt_personal: self.scaler.step(opt_personal)
                     self.scaler.step(opt_server); self.scaler.step(opt_global); self.scaler.update()
@@ -433,6 +441,11 @@ class EnhancedSerialTrainer:
         from torch.optim.lr_scheduler import CosineAnnealingLR
         start = time.time()
 
+        # 关键：统一迁移到同一设备
+        client_model.to(self.device)
+        server_model.to(self.device)
+        global_classifier.to(self.device)
+
         # 冻结共享层，主训个性化与本地头；server/global 小步微调
         for n,p in client_model.named_parameters():
             p.requires_grad = ('shared_base' not in n)
@@ -458,7 +471,7 @@ class EnhancedSerialTrainer:
                 data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
                 opt_personal.zero_grad(); opt_server.zero_grad(); opt_global.zero_grad()
 
-                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                with torch.cuda.amp.autocast(enabled=self.use_amp and torch.cuda.is_available()):
                     local_logits, shared_features, personal_features = client_model(data)
                     server_features = server_model(shared_features)
                     global_logits   = global_classifier(server_features)
@@ -468,7 +481,7 @@ class EnhancedSerialTrainer:
                         shared_features=shared_features, alpha=alpha
                     )
 
-                if self.use_amp:
+                if self.use_amp and torch.cuda.is_available():
                     self.scaler.scale(total_loss).backward()
                     self.scaler.unscale_(opt_personal); self.scaler.unscale_(opt_server); self.scaler.unscale_(opt_global)
                 else:
@@ -478,7 +491,7 @@ class EnhancedSerialTrainer:
                 for group in [server_model.parameters(), global_classifier.parameters()]:
                     clip_grad_norm_(list(group), max_norm=1.0)
 
-                if self.use_amp:
+                if self.use_amp and torch.cuda.is_available():
                     self.scaler.step(opt_personal); self.scaler.step(opt_server); self.scaler.step(opt_global); self.scaler.update()
                 else:
                     opt_personal.step(); opt_server.step(); opt_global.step()
