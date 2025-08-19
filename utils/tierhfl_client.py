@@ -123,6 +123,10 @@ class TierHFLClient:
         # 动态参数
         self.alpha = 0.5  # 本地损失权重
         self.lambda_feature = 0.1  # 特征对齐损失权重
+        
+        # AMP 支持
+        self.use_amp = (str(device) == "cuda")
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp) if self.use_amp else None
     
     def update_learning_rate(self, lr_factor=0.85):
         """更新学习率"""
@@ -178,23 +182,26 @@ class TierHFLClient:
             epoch_total = 0
             
             for batch_idx, (data, target) in enumerate(self.train_data):
-                # 移至设备
-                data, target = data.to(self.device), target.to(self.device)
+                # 移至设备 - 添加 non_blocking=True
+                data = data.to(self.device, non_blocking=True)
+                target = target.to(self.device, non_blocking=True)
                 
                 # 清除梯度
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 
-                # 前向传播
-                local_logits, shared_features, personal_features = self.model(data)
+                # 前向传播 - 添加 AMP 支持
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    local_logits, shared_features, personal_features = self.model(data)
+                    local_loss = F.cross_entropy(local_logits, target)
                 
-                # 计算本地损失
-                local_loss = F.cross_entropy(local_logits, target)
-                
-                # 反向传播
-                local_loss.backward()
-                
-                # 更新参数
-                optimizer.step()
+                # 反向传播 - 添加 AMP 支持
+                if self.use_amp and self.scaler is not None:
+                    self.scaler.scale(local_loss).backward()
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    local_loss.backward()
+                    optimizer.step()
                 
                 # 更新统计信息
                 epoch_loss += local_loss.item()
@@ -225,28 +232,23 @@ class TierHFLClient:
         
         # 计算平均值和总体准确率
         avg_local_loss = stats['local_loss'] / max(1, stats['batch_count'])
-        local_accuracy = 100.0 * stats['correct'] / max(1, stats['total'])
+        avg_local_acc = 100.0 * stats['correct'] / max(1, stats['total'])
         
         # 更新统计信息
         self.stats['local_loss'].append(avg_local_loss)
-        self.stats['train_acc'].append(local_accuracy)
+        self.stats['train_acc'].append(avg_local_acc)
         
-        # 返回结果
         return {
             'local_loss': avg_local_loss,
-            'local_accuracy': local_accuracy,
-            'training_time': time.time() - start_time
-        }, features_data
+            'local_accuracy': avg_local_acc,
+            'time_cost': time.time() - start_time,
+            'features_data': features_data
+        }
     
     def evaluate(self, server_model, global_classifier):
         """评估客户端模型"""
         if self.model is None:
             raise ValueError("客户端模型未设置")
-            
-        # 确保模型在正确的设备上
-        self.model = self.model.to(self.device)
-        server_model = server_model.to(self.device)
-        global_classifier = global_classifier.to(self.device)
         
         # 设置为评估模式
         self.model.eval()
@@ -260,13 +262,15 @@ class TierHFLClient:
         
         with torch.no_grad():
             for data, target in self.test_data:
-                # 移到设备
-                data, target = data.to(self.device), target.to(self.device)
+                # 移到设备 - 添加 non_blocking=True
+                data = data.to(self.device, non_blocking=True)
+                target = target.to(self.device, non_blocking=True)
                 
-                # 前向传播
-                local_logits, shared_features, _ = self.model(data)
-                server_features = server_model(shared_features)
-                global_logits = global_classifier(server_features)
+                # 前向传播 - 添加 AMP 支持
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    local_logits, shared_features, _ = self.model(data)
+                    server_features = server_model(shared_features)
+                    global_logits = global_classifier(server_features)
                 
                 # 计算准确率
                 _, local_pred = local_logits.max(1)
@@ -307,7 +311,7 @@ class TierHFLClient:
         
         # 更新参数
         shared_optimizer.step()
-        shared_optimizer.zero_grad()
+        shared_optimizer.zero_grad(set_to_none=True)
         
         return True
     
