@@ -882,9 +882,11 @@ class GlobalClassifierVerifier:
                 _, preds = logits.max(1)
                 accuracy = (preds == global_labels).float().mean().item() * 100
                 
-                # 计算分类分布
-                pred_dist = torch.zeros(10)
-                for i in range(10):
+                # 计算分类分布 - 动态获取类别数
+                num_classes = max(logits.shape[1] if len(logits.shape) > 1 else 10, 
+                                int(global_labels.max().item()) + 1 if len(global_labels) > 0 else 10)
+                pred_dist = torch.zeros(num_classes)
+                for i in range(num_classes):
                     pred_dist[i] = (preds == i).sum().item()
                 pred_dist = pred_dist / pred_dist.sum()
             

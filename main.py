@@ -121,7 +121,8 @@ class EnhancedSerialTrainer:
         """本轮只调用一次，把聚合后的权重复制到trainer持有的模型上"""
         self.server_model.load_state_dict(server_model.state_dict())
         self.global_classifier.load_state_dict(global_classifier.state_dict())
-        self.server_model.to(self.device).eval()          # 阶段1只训头部，server CNN冻结
+        # ⚠️ 注意：在初始阶段需要train()模式，不能强制eval()
+        self.server_model.to(self.device)         # 由具体训练阶段决定train/eval模式
         self.global_classifier.to(self.device).train()
 
     def _unwrap_loader(self, loader):
