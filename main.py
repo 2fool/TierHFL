@@ -19,16 +19,19 @@ import math
 # 忽略警告
 warnings.filterwarnings("ignore")
 
-# 添加当前目录到sys.path以支持扁平导入
-sys.path.insert(0, os.path.abspath(os.getcwd()))
+# 确保项目根目录在Python路径中 - Kaggle兼容
+project_root = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, project_root)
+print(f"项目根目录: {project_root}")
+print(f"当前工作目录: {os.getcwd()}")
 
 # 扁平导入自定义模块
-from resnet import EnhancedServerModel, TierAwareClientModel, ImprovedGlobalClassifier
-from tierhfl_aggregator import LayeredAggregator
-from tierhfl_client import TierHFLClientManager
-from tierhfl_loss import EnhancedStagedLoss
-from tierhfl_analyze import validate_server_effectiveness
-from diagnostic_monitor import EnhancedTierHFLDiagnosticMonitor
+from model.resnet import EnhancedServerModel, TierAwareClientModel, ImprovedGlobalClassifier
+from utils.tierhfl_aggregator import LayeredAggregator
+from utils.tierhfl_client import TierHFLClientManager
+from utils.tierhfl_loss import EnhancedStagedLoss
+from analyze.tierhfl_analyze import validate_server_effectiveness
+from analyze.diagnostic_monitor import EnhancedTierHFLDiagnosticMonitor
 
 # === logging setup (放在 main.py 的 import 之后) ===
 import logging, sys
