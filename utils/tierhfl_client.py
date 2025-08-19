@@ -252,6 +252,10 @@ class TierHFLClient:
         """评估客户端模型"""
         if self.model is None:
             raise ValueError("客户端模型未设置")
+
+        # 关键：把服务端与全局头搬到同一个 device
+        server_model       = server_model.to(self.device)
+        global_classifier  = global_classifier.to(self.device)
         
         # 设置为评估模式
         self.model.eval()
