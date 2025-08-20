@@ -20,6 +20,22 @@ def analyze_server_features(server_model, client_model, global_test_loader, devi
     features_all = []
     labels_all = []
     
+    # 🔥 自动推断类别数
+    if num_classes is None:
+        # 从全局分类器推断
+        if hasattr(server_model, 'global_classifier'):
+            for module in server_model.global_classifier.modules():
+                if isinstance(module, nn.Linear):
+                    num_classes = module.out_features
+                    break
+        # 从数据加载器推断
+        if num_classes is None:
+            for _, target in global_test_loader:
+                num_classes = max(int(target.max().item()) + 1, num_classes or 10)
+                break
+        # 兜底值
+        num_classes = num_classes or 100  # 🔥 CIFAR-100兜底
+    
     # 收集特征和标签
     with torch.no_grad():
         for data, target in global_test_loader:
@@ -144,7 +160,8 @@ def analyze_feature_consistency(server_model, client_models, test_data_dict, dev
         all_labels = torch.cat(list(client_labels.values()), dim=0)
         num_classes = int(all_labels.max().item()) + 1
     elif num_classes is None:
-        num_classes = 100  # fallback for CIFAR-100
+        # 🔥 自动推断类别数，统一逻辑  
+        num_classes = 100  # CIFAR-100默认值
     
     # 计算特征统计信息
     stats = {}

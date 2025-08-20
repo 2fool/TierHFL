@@ -1040,9 +1040,55 @@ def rand_bbox(size, lam):
     return bbx1, bby1, bbx2, bby2
 
 
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    """MixUp/CutMix的混合损失计算"""
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+def should_early_stop(round_idx, training_phase, acc, es_state, args):
+    """
+    智能早停判断函数，避免误触发
+    
+    Args:
+        round_idx: 当前轮次
+        training_phase: 训练阶段('initial', 'alternating', 'fine_tuning')
+        acc: 当前准确率
+        es_state: 早停状态字典
+        args: 参数对象
+    
+    Returns:
+        bool: 是否应该早停
+    """
+    import math
+    
+    # NaN防护
+    if acc is None or math.isnan(acc):
+        return False
+    
+    # 忽略初始阶段
+    if args.ignore_initial_phase_in_es and training_phase == 'initial':
+        return False
+    
+    # 最小轮数门槛
+    if (round_idx + 1) < args.min_rounds_before_es:
+        return False
+    
+    # 检查是否有显著改善
+    if acc > es_state['best'] + args.min_delta:
+        es_state['best'] = acc
+        es_state['bad'] = 0
+        es_state['last_improve_round'] = round_idx
+        es_state['improved'] = True
+        return False
+    
+    # 无改善，增加bad计数
+    es_state['bad'] += 1
+    es_state['improved'] = False
+    
+    # 判断是否达到耐心极限
+    return es_state['bad'] >= args.patience
+
+
+def reset_early_stop_on_phase_change(es_state, phase_name):
+    """阶段切换时重置早停状态"""
+    es_state['bad'] = 0
+    es_state['phase_reset'] = True
+    logging.info(f"阶段切换到{phase_name}，重置早停计数")
 
 
 def parse_arguments():
@@ -1052,9 +1098,9 @@ def parse_arguments():
     parser.add_argument('--running_name', default="TierHFL_Enhanced", type=str, help='实验名称')
     
     # 优化相关参数
-    parser.add_argument('--lr', default=0.005, type=float, help='初始学习率')
+    parser.add_argument('--lr', default=0.1, type=float, help='初始学习率(推荐CIFAR-100: 0.05-0.1)')
     parser.add_argument('--lr_factor', default=0.9, type=float, help='学习率衰减因子')
-    parser.add_argument('--wd', help='权重衰减参数', type=float, default=1e-4)
+    parser.add_argument('--wd', help='权重衰减参数', type=float, default=5e-4)
     
     # 模型相关参数
     parser.add_argument('--model', type=str, default='resnet56', help='使用的神经网络 (resnet56 或 resnet110)')
@@ -1093,7 +1139,12 @@ def parse_arguments():
     parser.add_argument('--use_offline_wandb', default=0, type=int, help='是否使用离线wandb记录(1表示是)')
     parser.add_argument('--log_tag', default='', type=str, help='日志标签，用于区分不同实验')
     parser.add_argument('--target_accuracy', default=None, type=float, help='目标精度，达到后立即停止训练(如60.0表示60%)')
-    parser.add_argument('--patience', default=15, type=int, help='早停耐心值，连续多少轮无改善后停止')
+    # 早停控制参数
+    parser.add_argument('--patience', default=25, type=int, help='早停耐心值，连续多少轮无改善后停止')
+    parser.add_argument('--monitor_metric', type=str, default='global_test_accuracy', help='早停监控的指标名称')
+    parser.add_argument('--min_delta', type=float, default=0.1, help='最小可感知提升(%)，防止微小抖动触发早停')
+    parser.add_argument('--ignore_initial_phase_in_es', type=int, default=1, help='是否忽略初始阶段的早停判断')
+    parser.add_argument('--min_rounds_before_es', type=int, default=30, help='开始早停判断的最小轮数')
     
     # 数据增广参数
     parser.add_argument('--mixup_alpha', default=0.4, type=float, help='MixUp的alpha参数(0表示关闭MixUp)')
@@ -1561,13 +1612,13 @@ def main():
     # 解析命令行参数
     args = parse_arguments()
 
-    # 🔥 训练阶段轮数自动计算（按GPT-5建议：10%/70%/20%配比）
+    # 🔥 训练阶段轮数自动计算（调整初始阶段比例）
     if args.initial_phase_rounds == 0:
-        args.initial_phase_rounds = max(1, int(args.rounds * 0.1))  # 10%
+        args.initial_phase_rounds = max(5, int(args.rounds * 0.05))  # 🔥 改为5%，最少5轮
     if args.alternating_phase_rounds == 0:
-        args.alternating_phase_rounds = max(1, int(args.rounds * 0.7))  # 70%
+        args.alternating_phase_rounds = max(1, int(args.rounds * 0.75))  # 🔥 改为75%
     if args.fine_tuning_phase_rounds == 0:
-        args.fine_tuning_phase_rounds = max(1, int(args.rounds * 0.2))  # 20%
+        args.fine_tuning_phase_rounds = max(1, int(args.rounds * 0.20))  # 保持20%
     
     # 确保总轮数匹配
     total_phase_rounds = args.initial_phase_rounds + args.alternating_phase_rounds + args.fine_tuning_phase_rounds
@@ -1748,11 +1799,16 @@ def main():
     best_accuracy = 0.0
     prev_global_acc = 0.0
     
-    # 🔥 早停参数
-    patience = args.patience  # 使用参数配置的耐心值
-    best_round = 0
-    no_improve_count = 0
+    # 🔥 早停状态初始化
+    es_state = {
+        'best': -1.0, 
+        'bad': 0, 
+        'last_improve_round': -1,
+        'improved': False,
+        'phase_reset': False
+    }
     target_accuracy = args.target_accuracy  # 目标精度
+    current_phase = None  # 追踪当前阶段
     
     # 在训练开始前进行初始验证
     initial_validation = validate_server_effectiveness(
@@ -1769,13 +1825,21 @@ def main():
         round_start_time = time.time()
         logger.info(f"===== 轮次 {round_idx+1}/{args.rounds} =====")
         
-        # 添加训练阶段信息
+        # 确定当前训练阶段并检测阶段切换
         if round_idx < args.initial_phase_rounds:
+            new_phase = "initial"
             logger.info("当前处于初始阶段（仅训练server+global）")
         elif round_idx < args.initial_phase_rounds + args.alternating_phase_rounds:
+            new_phase = "alternating"
             logger.info("当前处于交替训练阶段（全分支训练）")
         else:
+            new_phase = "fine_tuning"
             logger.info("当前处于精细调整阶段（偏个性化微调）")
+        
+        # 检测阶段切换，重置早停状态
+        if current_phase is not None and new_phase != current_phase:
+            reset_early_stop_on_phase_change(es_state, new_phase)
+        current_phase = new_phase
         
         # 执行训练 - 传递增强版诊断监控器
         train_results, eval_results, shared_states, training_time = trainer.execute_round(
@@ -1824,10 +1888,12 @@ def main():
             # 兜底：随便拿一个存在的客户端ID
             sample_client_id = int(list(client_models.keys())[0])
         
-        # 更新最佳准确率
-        is_best = global_model_accuracy > best_accuracy
-        if is_best:
-            best_accuracy = global_model_accuracy
+        # 🔥 使用新的智能早停逻辑
+        should_stop = should_early_stop(round_idx, current_phase, global_model_accuracy, es_state, args)
+        
+        # 更新最佳准确率（仅当有改善时）
+        if es_state['improved']:
+            best_accuracy = es_state['best']
             try:
                 torch.save({
                     'client_model': client_models[sample_client_id].state_dict(),
@@ -1846,20 +1912,10 @@ def main():
             logger.info(f"提前停止训练，最佳精度: {best_accuracy:.2f}%")
             break
         
-        # 🔥 早停检查
-        if global_model_accuracy > best_accuracy + 1e-4:  # 如果有显著改善
-            best_accuracy = global_model_accuracy
-            best_round = round_idx
-            no_improve_count = 0
-            logger.info(f"新的最佳准确率: {best_accuracy:.2f}% (轮次 {round_idx+1})")
-        else:
-            no_improve_count += 1
-            logger.info(f"无改善计数: {no_improve_count}/{patience}")
-        
-        # 判断是否需要早停
-        if no_improve_count >= patience:
-            logger.info(f"早停触发! 已连续{patience}轮无改善")
-            logger.info(f"最佳准确率: {best_accuracy:.2f}% (轮次 {best_round+1})")
+        # 🔥 早停判断
+        if should_stop:
+            logger.info(f"早停触发! 已连续{es_state['bad']}轮无显著改善(>{args.min_delta}%)")
+            logger.info(f"最佳准确率: {es_state['best']:.2f}% (轮次 {es_state['last_improve_round']+1})")
             break
         
         # 计算轮次时间
@@ -1869,8 +1925,13 @@ def main():
         logger.info(f"轮次 {round_idx+1} 统计:")
         logger.info(f"本地平均准确率: {avg_local_acc:.2f}%, 全局平均准确率: {avg_global_acc:.2f}%")
         logger.info(f"全局模型在独立测试集上的准确率: {global_model_accuracy:.2f}%")
-        logger.info(f"最佳准确率: {best_accuracy:.2f}%")
+        logger.info(f"最佳准确率: {es_state['best']:.2f}%")
         logger.info(f"轮次总时间: {round_time:.2f}秒, 训练: {training_time:.2f}秒, 聚合: {aggregation_time:.2f}秒")
+        
+        # 🔥 详细的早停状态日志
+        logger.info(f"[ES] 阶段={current_phase} 精度={global_model_accuracy:.2f} 最佳={es_state['best']:.2f} "
+                   f"无改善轮数={es_state['bad']}/{args.patience} 最小提升阈值={args.min_delta}% "
+                   f"最小轮数门槛={args.min_rounds_before_es}")
         
         # 记录准确率变化
         acc_change = global_model_accuracy - prev_global_acc
