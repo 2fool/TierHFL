@@ -184,19 +184,16 @@ class EnhancedSerialTrainer:
         eval_results = {}
         shared_states = {}
         
-        # 确定当前训练阶段 - 使用参数化边界而非硬编码
-        if round_idx < args.initial_feature_rounds:  # 🔥 使用initial_feature_rounds参数
+        # 确定当前训练阶段 - 按GPT-5建议的三阶段划分
+        if round_idx < args.initial_phase_rounds:
             training_phase = "initial"
-            logging.info(f"轮次 {round_idx+1}/{total_rounds} - 初始特征学习阶段")
-        elif round_idx < args.initial_phase_rounds:
-            training_phase = "initial"
-            logging.info(f"轮次 {round_idx+1}/{total_rounds} - 初始阶段")
+            logging.info(f"轮次 {round_idx+1}/{total_rounds} - 初始阶段（仅训练server+global）")
         elif round_idx < args.initial_phase_rounds + args.alternating_phase_rounds:
             training_phase = "alternating"
-            logging.info(f"轮次 {round_idx+1}/{total_rounds} - 交替训练阶段")
+            logging.info(f"轮次 {round_idx+1}/{total_rounds} - 交替训练阶段（全分支训练）")
         else:
             training_phase = "fine_tuning"
-            logging.info(f"轮次 {round_idx+1}/{total_rounds} - 精细调整阶段")
+            logging.info(f"轮次 {round_idx+1}/{total_rounds} - 精细调整阶段（偏个性化微调）")
         
         # 依次处理每个聚类（使用选择后的客户端）
         for cluster_id, client_ids in selected_cluster_map.items():
@@ -425,11 +422,35 @@ class EnhancedSerialTrainer:
             alpha = 0.6 - (0.6 - 0.4) * progress
 
         stat = {'total_loss': 0.0, 'batch_count': 0, 'local_correct': 0, 'global_correct': 0, 'total': 0}
+        
+        # 🔥 MixUp/CutMix设置
+        use_mixup = hasattr(args, 'mixup_alpha') and args.mixup_alpha > 0
+        use_cutmix = hasattr(args, 'cutmix_alpha') and args.cutmix_alpha > 0
+        augment_prob = getattr(args, 'augment_prob', 0.5)
 
         for _ in range(client.local_epochs):
             for data, target in client.train_data:
                 data   = data.to(self.device, non_blocking=True)
                 target = target.to(self.device, non_blocking=True)
+                
+                # 🔥 应用MixUp/CutMix数据增广
+                mixup_applied = False
+                y_a, y_b, lam = target, target, 1.0
+                
+                if (use_mixup or use_cutmix) and np.random.rand() < augment_prob:
+                    if use_mixup and use_cutmix:
+                        # 随机选择MixUp或CutMix
+                        if np.random.rand() < 0.5:
+                            data, y_a, y_b, lam = mixup_data(data, target, args.mixup_alpha, self.device)
+                        else:
+                            data, y_a, y_b, lam = cutmix_data(data, target, args.cutmix_alpha, self.device)
+                        mixup_applied = True
+                    elif use_mixup:
+                        data, y_a, y_b, lam = mixup_data(data, target, args.mixup_alpha, self.device)
+                        mixup_applied = True
+                    elif use_cutmix:
+                        data, y_a, y_b, lam = cutmix_data(data, target, args.cutmix_alpha, self.device)
+                        mixup_applied = True
 
                 if opt_shared:   opt_shared.zero_grad(set_to_none=True)
                 if opt_personal: opt_personal.zero_grad(set_to_none=True)
@@ -441,11 +462,32 @@ class EnhancedSerialTrainer:
                     server_features = server_model(shared_features)
                     global_logits   = classifier(server_features)
 
-                    total_loss, local_loss, global_loss, balance_loss = self.enhanced_loss.stage2_3_loss(
-                        local_logits, global_logits, target,
-                        personal_gradients=None, global_gradients=None,
-                        shared_features=shared_features, alpha=alpha
-                    )
+                    if mixup_applied:
+                        # 🔥 手动计算MixUp/CutMix的混合损失
+                        # 分别计算对y_a和y_b的损失，然后按lam加权组合
+                        total_loss_a, local_loss_a, global_loss_a, balance_loss_a = self.enhanced_loss.stage2_3_loss(
+                            local_logits, global_logits, y_a,
+                            personal_gradients=None, global_gradients=None,
+                            shared_features=shared_features, alpha=alpha
+                        )
+                        total_loss_b, local_loss_b, global_loss_b, balance_loss_b = self.enhanced_loss.stage2_3_loss(
+                            local_logits, global_logits, y_b,
+                            personal_gradients=None, global_gradients=None,
+                            shared_features=shared_features, alpha=alpha
+                        )
+                        
+                        # 按lam加权组合损失
+                        total_loss = lam * total_loss_a + (1 - lam) * total_loss_b
+                        local_loss = lam * local_loss_a + (1 - lam) * local_loss_b
+                        global_loss = lam * global_loss_a + (1 - lam) * global_loss_b
+                        balance_loss = lam * balance_loss_a + (1 - lam) * balance_loss_b
+                    else:
+                        # 使用标准损失
+                        total_loss, local_loss, global_loss, balance_loss = self.enhanced_loss.stage2_3_loss(
+                            local_logits, global_logits, target,
+                            personal_gradients=None, global_gradients=None,
+                            shared_features=shared_features, alpha=alpha
+                        )
 
                 if use_amp:
                     self.scaler.scale(total_loss).backward()
@@ -475,8 +517,16 @@ class EnhancedSerialTrainer:
 
                 stat['total_loss']   += float(total_loss.item()); stat['batch_count'] += 1
                 with torch.no_grad():
-                    stat['local_correct']  += (local_logits.argmax(1)  == target).sum().item()
-                    stat['global_correct'] += (global_logits.argmax(1) == target).sum().item()
+                    if mixup_applied:
+                        # MixUp/CutMix时，使用混合准确率计算
+                        pred_local = local_logits.argmax(1)
+                        pred_global = global_logits.argmax(1)
+                        stat['local_correct'] += (lam * (pred_local == y_a).float() + (1 - lam) * (pred_local == y_b).float()).sum().item()
+                        stat['global_correct'] += (lam * (pred_global == y_a).float() + (1 - lam) * (pred_global == y_b).float()).sum().item()
+                    else:
+                        # 标准准确率计算
+                        stat['local_correct']  += (local_logits.argmax(1)  == target).sum().item()
+                        stat['global_correct'] += (global_logits.argmax(1) == target).sum().item()
                     stat['total']          += target.size(0)
 
             if sch_shared:   sch_shared.step()
@@ -935,6 +985,66 @@ def set_seed(seed=42):
         torch.backends.cudnn.deterministic = True
 
 
+# === MixUp和CutMix数据增广实现 ===
+def mixup_data(x, y, alpha=0.4, device='cuda'):
+    """MixUp数据增广"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(device)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def cutmix_data(x, y, alpha=1.0, device='cuda'):
+    """CutMix数据增广"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(device)
+
+    y_a, y_b = y, y[index]
+    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
+    x[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
+    
+    # 调整lambda为实际的面积比例
+    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
+    return x, y_a, y_b, lam
+
+
+def rand_bbox(size, lam):
+    """为CutMix生成随机边界框"""
+    W = size[2]
+    H = size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    # 随机选择中心点
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    return bbx1, bby1, bbx2, bby2
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """MixUp/CutMix的混合损失计算"""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(description='TierHFL: 分层异构联邦学习框架 (增强版本)')
     
@@ -974,16 +1084,21 @@ def parse_arguments():
     parser.add_argument('--retier_interval', default=10, type=int, help='每隔多少轮重新分层/聚类')
     parser.add_argument('--mu', default=0.0, type=float, help='FedProx正则化系数(0表示关闭)')
     
-    # 训练阶段参数
-    parser.add_argument('--initial_feature_rounds', default=5, type=int, help='初始特征学习阶段轮数')
-    parser.add_argument('--initial_phase_rounds', default=2, type=int, help='初始阶段轮数')
-    parser.add_argument('--alternating_phase_rounds', default=0, type=int, help='交替训练阶段轮数(0表示自动计算)')
-    parser.add_argument('--fine_tuning_phase_rounds', default=0, type=int, help='精细调整阶段轮数')
+    # 训练阶段参数 - 根据GPT-5建议优化配比
+    parser.add_argument('--initial_feature_rounds', default=0, type=int, help='初始特征学习阶段轮数(建议设为总轮数10%)')
+    parser.add_argument('--initial_phase_rounds', default=0, type=int, help='初始阶段轮数(若为0则自动计算为总轮数10%)')
+    parser.add_argument('--alternating_phase_rounds', default=0, type=int, help='交替训练阶段轮数(若为0则自动计算为总轮数70%)')
+    parser.add_argument('--fine_tuning_phase_rounds', default=0, type=int, help='精细调整阶段轮数(若为0则自动计算为总轮数20%)')
 
     parser.add_argument('--use_offline_wandb', default=0, type=int, help='是否使用离线wandb记录(1表示是)')
     parser.add_argument('--log_tag', default='', type=str, help='日志标签，用于区分不同实验')
     parser.add_argument('--target_accuracy', default=None, type=float, help='目标精度，达到后立即停止训练(如60.0表示60%)')
     parser.add_argument('--patience', default=15, type=int, help='早停耐心值，连续多少轮无改善后停止')
+    
+    # 数据增广参数
+    parser.add_argument('--mixup_alpha', default=0.4, type=float, help='MixUp的alpha参数(0表示关闭MixUp)')
+    parser.add_argument('--cutmix_alpha', default=1.0, type=float, help='CutMix的alpha参数(0表示关闭CutMix)')
+    parser.add_argument('--augment_prob', default=0.5, type=float, help='应用MixUp/CutMix的概率')
 
     parser.add_argument("--device", type=str, default="auto",
                     choices=["auto", "cuda", "cpu", "mps"],
@@ -991,7 +1106,7 @@ def parse_arguments():
     parser.add_argument("--amp", action="store_true",
                         help="启用混合精度（仅在 cuda 时生效）")
     parser.add_argument("--num_workers", type=int, default=4,
-                        help="DataLoader 的工作进程数（Kaggle 推荐 2~4）")
+                        help="DataLoader 的工作进程数（推荐 4~8）")
     
     # 训练阶段参数
     parser.add_argument("--server_first_warmup", action="store_true",
@@ -1070,8 +1185,8 @@ def fallback_load_partition_data_fashion_mnist(dataset, data_dir, partition_meth
     train_data_local_dict, test_data_local_dict, train_data_local_num_dict = {}, {}, {}
     for cid in range(client_number):
         train_subset = Subset(trainset, splits[cid])
-        train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=False)
-        test_loader  = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=False)
+        train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=pin_mem, persistent_workers=True if args.num_workers > 0 else False)
+        test_loader  = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=pin_mem, persistent_workers=True if args.num_workers > 0 else False)
         train_data_local_dict[cid] = train_loader
         test_data_local_dict[cid] = test_loader
         train_data_local_num_dict[cid] = len(train_subset)
@@ -1213,7 +1328,7 @@ def load_global_test_set(args):
         testset = torchvision.datasets.CIFAR10(
             root=args.data_dir, train=False, download=True, transform=transform_test)
         test_loader = torch.utils.data.DataLoader(
-            testset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+            testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
         
         return test_loader
     
@@ -1227,7 +1342,7 @@ def load_global_test_set(args):
         testset = torchvision.datasets.CIFAR100(
             root=args.data_dir, train=False, download=True, transform=transform_test)
         test_loader = torch.utils.data.DataLoader(
-            testset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+            testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
         
         return test_loader
     
@@ -1241,7 +1356,7 @@ def load_global_test_set(args):
         testset = torchvision.datasets.FashionMNIST(
             root=args.data_dir, train=False, download=True, transform=transform_test)
         test_loader = torch.utils.data.DataLoader(
-            testset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+            testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
         
         return test_loader
     
@@ -1257,7 +1372,7 @@ def load_global_test_set(args):
             root=os.path.join(args.data_dir, 'cinic10', 'test'),
             transform=transform_test)
         test_loader = torch.utils.data.DataLoader(
-            testset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+            testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
         
         return test_loader
     else:
@@ -1446,10 +1561,24 @@ def main():
     # 解析命令行参数
     args = parse_arguments()
 
-    # 🔥 训练阶段轮数自动计算（如果未指定）
+    # 🔥 训练阶段轮数自动计算（按GPT-5建议：10%/70%/20%配比）
+    if args.initial_phase_rounds == 0:
+        args.initial_phase_rounds = max(1, int(args.rounds * 0.1))  # 10%
     if args.alternating_phase_rounds == 0:
+        args.alternating_phase_rounds = max(1, int(args.rounds * 0.7))  # 70%
+    if args.fine_tuning_phase_rounds == 0:
+        args.fine_tuning_phase_rounds = max(1, int(args.rounds * 0.2))  # 20%
+    
+    # 确保总轮数匹配
+    total_phase_rounds = args.initial_phase_rounds + args.alternating_phase_rounds + args.fine_tuning_phase_rounds
+    if total_phase_rounds != args.rounds:
+        # 调整交替阶段轮数以确保总数匹配
         args.alternating_phase_rounds = args.rounds - args.initial_phase_rounds - args.fine_tuning_phase_rounds
-        args.alternating_phase_rounds = max(1, args.alternating_phase_rounds)  # 确保至少1轮
+        args.alternating_phase_rounds = max(1, args.alternating_phase_rounds)
+    
+    # 兼容旧版本：如果设置了initial_feature_rounds，将其合并到initial_phase_rounds
+    if args.initial_feature_rounds > 0:
+        args.initial_phase_rounds = max(args.initial_phase_rounds, args.initial_feature_rounds)
 
     log_file = setup_logging(run_name=getattr(args, "running_name", "run"))
 
@@ -1642,11 +1771,11 @@ def main():
         
         # 添加训练阶段信息
         if round_idx < args.initial_phase_rounds:
-            logger.info("当前处于初始特征学习阶段")
+            logger.info("当前处于初始阶段（仅训练server+global）")
         elif round_idx < args.initial_phase_rounds + args.alternating_phase_rounds:
-            logger.info("当前处于交替训练阶段")
+            logger.info("当前处于交替训练阶段（全分支训练）")
         else:
-            logger.info("当前处于精细调整阶段")
+            logger.info("当前处于精细调整阶段（偏个性化微调）")
         
         # 执行训练 - 传递增强版诊断监控器
         train_results, eval_results, shared_states, training_time = trainer.execute_round(
