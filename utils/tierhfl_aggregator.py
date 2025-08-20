@@ -38,8 +38,25 @@ class LayeredAggregator:
                 out[key] = (acc / wsum).to(dtype=acc_dtype)
         return out
 
-    def aggregate_shared_layers(self, shared_states: dict, eval_results: dict):
-        client_weights = self._build_weights(eval_results, key_samples="train_samples", key_acc="global_accuracy")
+    def aggregate_shared_layers(self, shared_states: dict, eval_results: dict=None):
+        """聚合客户端共享层，加入None兜底逻辑"""
+        if not shared_states:
+            return {}
+            
+        # 当eval_results为空时，使用均匀权重兜底（与server/classifier的兜底一致）
+        if not eval_results:
+            n = len(shared_states) or 1
+            client_weights = {cid: 1.0 / n for cid in shared_states.keys()}
+        else:
+            # 与现有实现保持一致：样本数 * 精度 + epsilon
+            client_weights = self._build_weights(
+                eval_results,
+                key_samples="train_samples",
+                key_acc="global_accuracy",
+                use_acc_weight=True,
+                eps=1e-9
+            )
+        
         return self._weighted_average(shared_states, client_weights)
 
     def aggregate_server_models(self, cluster_server_models: dict, eval_results: dict=None, beta: float=0.9):

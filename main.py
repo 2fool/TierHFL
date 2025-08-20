@@ -1857,7 +1857,7 @@ def main():
         current_phase = new_phase
         
         # 根据训练阶段更新本地epochs
-        target_local_epochs = 2 if new_phase == "initial" else 3  # E=1 for initial, E=2 for alternating/fine_tuning
+        target_local_epochs = 1 if new_phase == "initial" else 2  # E=1 for initial, E=2 for alternating/fine_tuning
         for client_id in range(args.client_number):
             client = client_manager.get_client(client_id)
             if client:
