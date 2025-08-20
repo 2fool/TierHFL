@@ -112,9 +112,10 @@ class EnhancedSerialTrainer:
         self.layered_aggregator = LayeredAggregator(device=str(self.device))
 
         from utils.tierhfl_loss import EnhancedStagedLoss
+        # 🔥 GPT-5优化指导: ls_eps=0.1, entropy_coeff=1e-3
         self.enhanced_loss = EnhancedStagedLoss(
-            ls_eps=0.05,       # 降低标签平滑，减少小类信息被抹平
-            entropy_coeff=2e-3  # 增强全局头的输出熵约束，防止单类偏好
+            ls_eps=0.1,       # GPT-5推荐: 标签平滑增强到0.1
+            entropy_coeff=1e-3  # GPT-5推荐: 熵正则降低到1e-3
         )
         
         # 客户端性能追踪（用于分层采样）
@@ -401,11 +402,11 @@ class EnhancedSerialTrainer:
         server_params   = list(server_model.parameters())
         global_params   = list(classifier.parameters())
 
-        # 优化器（在 to(device) 之后）
-        opt_shared    = torch.optim.SGD(shared_params,   lr=client.lr, momentum=0.9, weight_decay=client.wd) if shared_params else None
-        opt_personal  = torch.optim.SGD(personal_params, lr=client.lr, momentum=0.9, weight_decay=client.wd) if personal_params else None
-        opt_server    = torch.optim.SGD(server_params,   lr=client.lr, momentum=0.9, weight_decay=client.wd)
-        opt_global    = torch.optim.SGD(global_params,   lr=client.lr, momentum=0.9, weight_decay=client.wd)
+        # 🔥 GPT-5优化: 使用SGD with Nesterov, weight_decay=5e-4
+        opt_shared    = torch.optim.SGD(shared_params,   lr=client.lr, momentum=0.9, weight_decay=5e-4, nesterov=True) if shared_params else None
+        opt_personal  = torch.optim.SGD(personal_params, lr=client.lr, momentum=0.9, weight_decay=5e-4, nesterov=True) if personal_params else None
+        opt_server    = torch.optim.SGD(server_params,   lr=client.lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
+        opt_global    = torch.optim.SGD(global_params,   lr=client.lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
 
         sch_shared    = CosineAnnealingLR(opt_shared,   T_max=max(1, client.local_epochs), eta_min=0.0) if opt_shared else None
         sch_personal  = CosineAnnealingLR(opt_personal, T_max=max(1, client.local_epochs), eta_min=0.0) if opt_personal else None
@@ -488,6 +489,11 @@ class EnhancedSerialTrainer:
                             personal_gradients=None, global_gradients=None,
                             shared_features=shared_features, alpha=alpha
                         )
+                
+                # 🔥 GPT-5优化: 添加FedProx正则化项 (μ=0.005)
+                if hasattr(self, 'mu') and self.mu > 0:
+                    prox_loss = self.compute_prox_loss(client_model, server_model, self.mu)
+                    total_loss += prox_loss
 
                 if use_amp:
                     self.scaler.scale(total_loss).backward()
@@ -901,17 +907,41 @@ class EnhancedSerialTrainer:
         
         return updated
 
-    def select_clients_for_round(self, cluster_map, client_fraction=0.7, round_idx=0):
+    def merge_tiny_clusters(self, cluster_map, min_size=2):
+        """合并过小聚类到最近簇"""
+        # 找到过小的聚类
+        tiny_clusters = [cid for cid, clients in cluster_map.items() if len(clients) < min_size]
+        
+        for tiny_cid in tiny_clusters:
+            if len(cluster_map[tiny_cid]) == 0:
+                continue
+                
+            # 找到拥有最多客户端的簇进行合并
+            largest_cid = max([cid for cid in cluster_map.keys() if cid != tiny_cid], 
+                            key=lambda cid: len(cluster_map[cid]), default=None)
+            
+            if largest_cid is not None:
+                cluster_map[largest_cid].extend(cluster_map[tiny_cid])
+                cluster_map[tiny_cid] = []
+                logging.info(f"合并小聚类 {tiny_cid} 到聚类 {largest_cid}")
+        
+        # 移除空聚类
+        cluster_map = {cid: clients for cid, clients in cluster_map.items() if len(clients) > 0}
+        return cluster_map
+
+    def select_clients_for_round(self, cluster_map, client_fraction=0.8, round_idx=0):
         """分层采样选择本轮参与训练的客户端"""
+        # 🔥 合并过小聚类，确保没有空簇
+        cluster_map = self.merge_tiny_clusters(cluster_map, min_size=2)
+        
         selected_cluster_map = {}
         
         for cluster_id, client_ids in cluster_map.items():
             if len(client_ids) == 0:
-                selected_cluster_map[cluster_id] = []
                 continue
                 
-            # 计算该聚类中应选择的客户端数量
-            k = max(1, int(len(client_ids) * client_fraction))
+            # 计算该聚类中应选择的客户端数量 - 🔥 至少选择2个
+            k = max(2, int(math.ceil(len(client_ids) * client_fraction)))
             
             if k >= len(client_ids):
                 # 如果需要选择的数量大于等于总数，选择所有客户端
@@ -1098,7 +1128,7 @@ def parse_arguments():
     parser.add_argument('--running_name', default="TierHFL_Enhanced", type=str, help='实验名称')
     
     # 优化相关参数
-    parser.add_argument('--lr', default=0.1, type=float, help='初始学习率(推荐CIFAR-100: 0.05-0.1)')
+    parser.add_argument('--lr', default=0.1, type=float, help='初始学习率 (推荐CIFAR-100: 0.1)')
     parser.add_argument('--lr_factor', default=0.9, type=float, help='学习率衰减因子')
     parser.add_argument('--wd', help='权重衰减参数', type=float, default=5e-4)
     
@@ -1115,7 +1145,7 @@ def parse_arguments():
     # 联邦学习相关参数
     parser.add_argument('--client_epoch', default=5, type=int, help='客户端本地训练轮数')
     parser.add_argument('--client_number', type=int, default=5, help='客户端数量')
-    parser.add_argument('--batch_size', type=int, default=256, help='训练的输入批次大小')
+    parser.add_argument('--batch_size', type=int, default=128, help='训练的输入批次大小 (GPT-5推荐: 128 for T4)')
     parser.add_argument('--rounds', default=100, type=int, help='联邦学习轮数')
     parser.add_argument('--n_clusters', default=3, type=int, help='客户端聚类数量')
     
@@ -1125,16 +1155,16 @@ def parse_arguments():
     parser.add_argument('--init_lambda', default=0.15, type=float, help='初始特征对齐损失权重')
     parser.add_argument('--beta', default=0.3, type=float, help='聚合动量因子')
     
-    # 分层采样参数
-    parser.add_argument('--client_fraction', default=0.7, type=float, help='每轮参与训练的客户端比例(0-1)')
+    # 分层采样参数 (GPT-5优化指导)
+    parser.add_argument('--client_fraction', default=0.8, type=float, help='每轮参与训练的客户端比例(0-1) - GPT-5推荐: 0.8')
     parser.add_argument('--retier_interval', default=10, type=int, help='每隔多少轮重新分层/聚类')
-    parser.add_argument('--mu', default=0.0, type=float, help='FedProx正则化系数(0表示关闭)')
+    parser.add_argument('--mu', default=0.005, type=float, help='FedProx正则化系数 - GPT-5推荐: 0.005')
     
     # 训练阶段参数 - 根据GPT-5建议优化配比
     parser.add_argument('--initial_feature_rounds', default=0, type=int, help='初始特征学习阶段轮数(建议设为总轮数10%)')
-    parser.add_argument('--initial_phase_rounds', default=0, type=int, help='初始阶段轮数(若为0则自动计算为总轮数10%)')
+    parser.add_argument('--initial_phase_rounds', default=0, type=int, help='初始阶段轮数(若为0则自动计算为总轮数8%)')
     parser.add_argument('--alternating_phase_rounds', default=0, type=int, help='交替训练阶段轮数(若为0则自动计算为总轮数70%)')
-    parser.add_argument('--fine_tuning_phase_rounds', default=0, type=int, help='精细调整阶段轮数(若为0则自动计算为总轮数20%)')
+    parser.add_argument('--fine_tuning_phase_rounds', default=0, type=int, help='精细调整阶段轮数(若为0则自动计算为总轮数22%)')
 
     parser.add_argument('--use_offline_wandb', default=0, type=int, help='是否使用离线wandb记录(1表示是)')
     parser.add_argument('--log_tag', default='', type=str, help='日志标签，用于区分不同实验')
@@ -1146,9 +1176,10 @@ def parse_arguments():
     parser.add_argument('--ignore_initial_phase_in_es', type=int, default=1, help='是否忽略初始阶段的早停判断')
     parser.add_argument('--min_rounds_before_es', type=int, default=30, help='开始早停判断的最小轮数')
     
-    # 数据增广参数
-    parser.add_argument('--mixup_alpha', default=0.4, type=float, help='MixUp的alpha参数(0表示关闭MixUp)')
-    parser.add_argument('--cutmix_alpha', default=1.0, type=float, help='CutMix的alpha参数(0表示关闭CutMix)')
+    # 数据增广参数 (GPT-5优化指导)
+    parser.add_argument('--mixup_alpha', default=0.4, type=float, help='MixUp的alpha参数(0表示关闭MixUp) - GPT-5推荐: 0.4')
+    parser.add_argument('--cutmix_alpha', default=1.0, type=float, help='CutMix的alpha参数(0表示关闭CutMix) - GPT-5推荐: 1.0')
+    parser.add_argument('--cutmix_prob', default=0.6, type=float, help='CutMix应用概率 - GPT-5推荐: 0.6')
     parser.add_argument('--augment_prob', default=0.5, type=float, help='应用MixUp/CutMix的概率')
 
     parser.add_argument("--device", type=str, default="auto",
@@ -1721,14 +1752,18 @@ def main():
     logger.info("创建服务器特征提取模型...")
     server_model = EnhancedServerModel(
         model_type=args.model,
-        feature_dim=384,  # 🔥 从256提升到384，进一步提升CIFAR-100表征能力
-        input_channels=input_channels  # 添加输入通道参数
+        feature_dim=384,  
+        input_channels=input_channels
     ).to(device)
+    
+    # 为卷积层启用channels_last内存格式
+    if device.type == "cuda":
+        server_model = server_model.to(memory_format=torch.channels_last)
     
     # 创建全局分类器
     logger.info("创建全局分类器...")
     global_classifier = ImprovedGlobalClassifier(
-        feature_dim=384,  # 🔥 从256提升到384，匹配服务器特征维度
+        feature_dim=384,  
         num_classes=class_num
     ).to(device)
     
@@ -1779,7 +1814,8 @@ def main():
     )
     
     # Cosine学习率调度，带5轮warmup
-    def cosine_lr_with_warmup(optimizer, current_round, total_rounds, warmup_rounds=5, eta_min=1e-4):
+    def cosine_lr_with_warmup(optimizer, current_round, total_rounds, warmup_rounds=5, eta_min_ratio=1/50):
+        base_lr = args.lr
         if current_round < warmup_rounds:
             # Warmup阶段：线性增长到初始学习率
             lr_factor = (current_round + 1) / warmup_rounds
@@ -1787,12 +1823,13 @@ def main():
             # Cosine退火阶段
             progress = (current_round - warmup_rounds) / (total_rounds - warmup_rounds)
             lr_factor = 0.5 * (1 + np.cos(np.pi * progress))
-            lr_factor = max(lr_factor, eta_min / args.lr)  # 确保不低于eta_min
+            lr_factor = max(lr_factor, eta_min_ratio)  # 确保不低于eta_min_ratio
         
+        current_lr = base_lr * lr_factor
         for param_group in optimizer.param_groups:
-            param_group['lr'] = args.lr * lr_factor
+            param_group['lr'] = current_lr
         
-        return args.lr * lr_factor
+        return current_lr
     
     # 开始训练循环
     logger.info(f"开始联邦学习训练 ({args.rounds} 轮)...")
@@ -1840,6 +1877,13 @@ def main():
         if current_phase is not None and new_phase != current_phase:
             reset_early_stop_on_phase_change(es_state, new_phase)
         current_phase = new_phase
+        
+        # 根据训练阶段更新本地epochs
+        target_local_epochs = 1 if new_phase == "initial" else 2  # E=1 for initial, E=2 for alternating/fine_tuning
+        for client_id in range(args.client_number):
+            client = client_manager.get_client(client_id)
+            if client:
+                client.local_epochs = target_local_epochs
         
         # 执行训练 - 传递增强版诊断监控器
         train_results, eval_results, shared_states, training_time = trainer.execute_round(
@@ -2011,9 +2055,9 @@ def main():
             except Exception as e:
                 logger.error(f"重新聚类失败: {str(e)}")
         
-        # 🔥 全局Cosine学习率调度
+        # 全局Cosine学习率调度
         current_global_lr = cosine_lr_with_warmup(
-            global_optimizer, round_idx, args.rounds, warmup_rounds=5, eta_min=1e-4
+            global_optimizer, round_idx, args.rounds, warmup_rounds=5, eta_min_ratio=1/50
         )
         
         # 同步客户端学习率（可选择性地设置为全局学习率的一定比例）

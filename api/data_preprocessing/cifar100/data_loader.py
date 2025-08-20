@@ -84,11 +84,11 @@ def _data_transforms_cifar100():
         transforms.ToPILImage(),
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
-        # 🔥 更强的数据增广：AutoAugment
-        transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10),  # CIFAR10 policy也适用于CIFAR100
+        # 🔥 使用RandAugment替代AutoAugment (GPT-5推荐: N=2, M=9)
+        transforms.RandAugment(num_ops=2, magnitude=9),
         transforms.ToTensor(),
         transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
-        # 🔥 RandomErasing替代Cutout，提供更多样的遮挡
+        # 🔥 RandomErasing替代Cutout，提供更多样的遮挡 (GPT-5推荐: p=0.25)
         transforms.RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
     ])
 
