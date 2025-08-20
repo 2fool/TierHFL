@@ -566,6 +566,13 @@ class EnhancedSerialTrainer:
         client_model.to(self.device)
         self.server_model.to(self.device)
         self.global_classifier.to(self.device)
+        
+        # 保存共享层锚点用于FedProx
+        anchor_shared = {
+            n: p.detach().clone()
+            for n, p in client_model.named_parameters()
+            if 'shared_base' in n
+        }
 
         # 冻结共享层，主训个性化与本地头；server/global 小步微调
         for n,p in client_model.named_parameters():
@@ -608,6 +615,11 @@ class EnhancedSerialTrainer:
                         personal_gradients=None, global_gradients=None,
                         shared_features=shared_features, alpha=alpha
                     )
+                    
+                # 添加FedProx正则化项
+                if hasattr(self, 'mu') and self.mu > 0:
+                    prox_loss = self.compute_prox_loss(client_model, anchor_shared, self.mu)
+                    total_loss += prox_loss
 
                 if self.use_amp and torch.cuda.is_available():
                     self.scaler.scale(total_loss).backward()
@@ -1164,7 +1176,7 @@ def parse_arguments():
                     help="auto 优先 cuda，其次 mps，最后 cpu")
     parser.add_argument("--amp", action="store_true",
                         help="启用混合精度（仅在 cuda 时生效）")
-    parser.add_argument("--num_workers", type=int, default=4,
+    parser.add_argument("--num_workers", type=int, default=2,
                         help="DataLoader 的工作进程数（推荐 4~8）")
     
     # 训练阶段参数
@@ -1644,7 +1656,15 @@ def main():
 
     import logging
     logger = logging.getLogger("TierHFL")
-    setup_wandb(args)
+    
+    # 初始化wandb并获取启用状态
+    WANDB_ENABLED = False
+    try:
+        setup_wandb(args)
+        WANDB_ENABLED = getattr(wandb, "run", None) is not None
+    except Exception as e:
+        logger.warning(f"wandb初始化失败: {e}")
+        WANDB_ENABLED = False
 
     logger.info("初始化TierHFL: 增强版本 - 集成梯度投影和分层聚合")
 
@@ -2016,7 +2036,7 @@ def main():
                 avg_balance_loss = np.mean([result.get('balance_loss', 0) for result in train_results.values()])
                 metrics["training/avg_balance_loss"] = avg_balance_loss
             
-            if getattr(wandb, "run", None) is not None:
+            if WANDB_ENABLED:
                 wandb.log(metrics)
         except Exception as e:
             logger.error(f"记录wandb指标失败: {str(e)}")
@@ -2040,8 +2060,8 @@ def main():
             global_optimizer, round_idx, args.rounds, warmup_rounds=5, eta_min_ratio=1/50
         )
         
-        # 同步客户端学习率（可选择性地设置为全局学习率的一定比例）
-        client_lr_ratio = 1.0  # 客户端与全局学习率的比例
+        # 同步客户端学习率（根据本地epoch调整比例以避免过步长）
+        client_lr_ratio = 0.8  # 客户端与全局学习率的比例，调整以配合增加的本地epochs
         for client_id in range(args.client_number):
             client = client_manager.get_client(client_id)
             if client:
@@ -2070,7 +2090,7 @@ def main():
                 logger.info(f"轮次 {round_idx+1} 客户端特征平均相似度: {similarity:.4f}")
                 
                 # 记录到wandb
-                if getattr(wandb, "run", None) is not None:
+                if WANDB_ENABLED:
                     wandb.log({"diagnostic/feature_similarity": similarity, "round": round_idx + 1})
                     
             except Exception as e:
@@ -2078,7 +2098,7 @@ def main():
             
             # 记录验证结果
             try:
-                if getattr(wandb, "run", None) is not None:
+                if WANDB_ENABLED:
                     wandb.log({
                         "round": round_idx + 1,
                         "validation/feature_quality": round_validation['feature_quality'],
