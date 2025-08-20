@@ -353,7 +353,8 @@ class EnhancedSerialTrainer:
                 total   += target.size(0)
 
         train_acc = 100.0 * correct / max(1, total)
-        return {"train_loss": running_loss / max(1, len(client.train_data)), "train_acc": train_acc}
+        train_samples = len(client.train_data.dataset) if hasattr(client.train_data, 'dataset') else total
+        return {"train_loss": running_loss / max(1, len(client.train_data)), "train_acc": train_acc, "train_samples": train_samples}
 
     def _train_alternating_phase_enhanced(
         self, client, client_model, server_model, classifier, round_idx, total_rounds, diagnostic_monitor=None
@@ -454,12 +455,14 @@ class EnhancedSerialTrainer:
         avg_loss   = stat['total_loss'] / max(1, stat['batch_count'])
         acc_local  = 100.0 * stat['local_correct']  / max(1, stat['total'])
         acc_global = 100.0 * stat['global_correct'] / max(1, stat['total'])
+        train_samples = len(client.train_data.dataset) if hasattr(client.train_data, 'dataset') else stat['total']
 
         return {
             'train_loss': avg_loss,
             'local_accuracy': acc_local,
             'global_accuracy': acc_global,
             'time_cost': time.time() - start,
+            'train_samples': train_samples
         }
 
 
@@ -538,8 +541,9 @@ class EnhancedSerialTrainer:
         avg_loss   = stat['total_loss'] / max(1, stat['batch_count'])
         acc_local  = 100.0 * stat['local_correct']  / max(1, stat['total'])
         acc_global = 100.0 * stat['global_correct'] / max(1, stat['total'])
+        train_samples = len(client.train_data.dataset) if hasattr(client.train_data, 'dataset') else stat['total']
         return {'train_loss': avg_loss, 'local_accuracy': acc_local, 'global_accuracy': acc_global,
-                'time_cost': time.time()-start}
+                'time_cost': time.time()-start, 'train_samples': train_samples}
 
 
 
@@ -590,7 +594,8 @@ class EnhancedSerialTrainer:
 
         avg_local = stat['local_loss'] / max(1, stat['batch_count'])
         acc_local = 100.0 * stat['correct'] / max(1, stat['total'])
-        return {'local_loss': avg_local, 'local_accuracy': acc_local, 'time_cost': time.time() - start}
+        train_samples = len(client.train_data.dataset) if hasattr(client.train_data, 'dataset') else stat['total']
+        return {'local_loss': avg_local, 'local_accuracy': acc_local, 'time_cost': time.time() - start, 'train_samples': train_samples}
 
 
     def _train_global_path_enhanced(self, client, client_model, server_model, classifier, 
@@ -695,13 +700,17 @@ class EnhancedSerialTrainer:
         else:
             stats['global_accuracy'] = 0.0
         
+        # 获取训练样本数
+        train_samples = len(client.train_data.dataset) if hasattr(client.train_data, 'dataset') else stats['total']
+        
         return {
             'global_loss': stats['global_loss'],
             'local_loss': stats['local_loss'],
             'balance_loss': stats['balance_loss'],
             'total_loss': stats['total_loss'],
             'global_accuracy': stats['global_accuracy'],
-            'time_cost': time.time() - start_time
+            'time_cost': time.time() - start_time,
+            'train_samples': train_samples
         }
 
     def _evaluate_client(self, client, client_model, server_model, global_classifier):
@@ -854,6 +863,14 @@ def parse_arguments():
                         help="启用混合精度（仅在 cuda 时生效）")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader 的工作进程数（Kaggle 推荐 2~4）")
+    
+    # 训练阶段参数
+    parser.add_argument("--server_first_warmup", action="store_true",
+                        help="在初始阶段优先训练服务器模型")
+    parser.add_argument("--warmup_rounds", type=int, default=2,
+                        help="预热轮数")
+    parser.add_argument("--disable_agg_rounds", type=int, default=0,
+                        help="禁用聚合的轮数")
 
     
     args = parser.parse_args()
@@ -1494,6 +1511,14 @@ def main():
         # 计算平均准确率
         avg_local_acc = np.mean([result.get('local_accuracy', 0) for result in eval_results.values()])
         avg_global_acc = np.mean([result.get('global_accuracy', 0) for result in eval_results.values()])
+        
+        # 选择一个用于保存的样例客户端
+        tier1_clients = [cid for cid, resource in client_resources.items() if resource.get("tier", 2) == 1]
+        if len(tier1_clients) > 0:
+            sample_client_id = int(tier1_clients[0])
+        else:
+            # 兜底：随便拿一个存在的客户端ID
+            sample_client_id = int(list(client_models.keys())[0])
         
         # 更新最佳准确率
         is_best = global_model_accuracy > best_accuracy

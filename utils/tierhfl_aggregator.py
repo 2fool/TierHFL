@@ -39,28 +39,33 @@ class LayeredAggregator:
         return out
 
     def aggregate_shared_layers(self, shared_states: dict, eval_results: dict):
-        client_weights = {cid: float(res.get("global_accuracy", 0.0)) for cid, res in eval_results.items()}
-        s = sum(client_weights.values())
-        if s <= 0:
-            n = len(eval_results) or 1
-            client_weights = {cid: 1.0 / n for cid in eval_results.keys()}
-        else:
-            client_weights = {cid: w / s for cid, w in client_weights.items()}
+        client_weights = self._build_weights(eval_results, key_samples="train_samples", key_acc="global_accuracy")
         return self._weighted_average(shared_states, client_weights)
 
     def aggregate_server_models(self, cluster_server_models: dict, eval_results: dict=None, beta: float=0.9):
         cluster_weights = {}
         if eval_results:
+            # 按聚类汇总权重
+            cluster_samples = {}
+            cluster_accuracy = {}
             for cid, res in eval_results.items():
                 cluster_id = res.get("cluster_id", 0)
-                acc = float(res.get("global_accuracy", 0.0))
-                cluster_weights[cluster_id] = cluster_weights.get(cluster_id, 0.0) + max(acc, 0.0)
+                samples = max(float(res.get("train_samples", 1)), 1)  # 避免除零
+                acc = max(float(res.get("global_accuracy", 0.0)), 0.0)
+                cluster_samples[cluster_id] = cluster_samples.get(cluster_id, 0) + samples
+                cluster_accuracy[cluster_id] = cluster_accuracy.get(cluster_id, 0) + acc * samples
+            
+            for cluster_id in cluster_samples:
+                avg_acc = cluster_accuracy[cluster_id] / max(cluster_samples[cluster_id], 1)
+                cluster_weights[cluster_id] = cluster_samples[cluster_id] * (avg_acc + 0.01)  # 加epsilon避免零权重
+        
         s = sum(cluster_weights.values())
         if s <= 0:
             n = len(cluster_server_models) or 1
             cluster_weights = {k: 1.0 / n for k in cluster_server_models.keys()}
         else:
             cluster_weights = {k: v / s for k, v in cluster_weights.items()}
+        
         avg_state = self._weighted_average(cluster_server_models, cluster_weights)
         if not self.server_momentum:
             self.server_momentum = {k: v.clone() for k, v in avg_state.items()}
@@ -72,16 +77,27 @@ class LayeredAggregator:
     def aggregate_global_classifiers(self, cluster_classifiers: dict, eval_results: dict=None, beta: float=0.9):
         cluster_weights = {}
         if eval_results:
+            # 按聚类汇总权重
+            cluster_samples = {}
+            cluster_accuracy = {}
             for cid, res in eval_results.items():
                 cluster_id = res.get("cluster_id", 0)
-                acc = float(res.get("global_accuracy", 0.0))
-                cluster_weights[cluster_id] = cluster_weights.get(cluster_id, 0.0) + max(acc, 0.0)
+                samples = max(float(res.get("train_samples", 1)), 1)  # 避免除零
+                acc = max(float(res.get("global_accuracy", 0.0)), 0.0)
+                cluster_samples[cluster_id] = cluster_samples.get(cluster_id, 0) + samples
+                cluster_accuracy[cluster_id] = cluster_accuracy.get(cluster_id, 0) + acc * samples
+            
+            for cluster_id in cluster_samples:
+                avg_acc = cluster_accuracy[cluster_id] / max(cluster_samples[cluster_id], 1)
+                cluster_weights[cluster_id] = cluster_samples[cluster_id] * (avg_acc + 0.01)  # 加epsilon避免零权重
+        
         s = sum(cluster_weights.values())
         if s <= 0:
             n = len(cluster_classifiers) or 1
             cluster_weights = {k: 1.0 / n for k in cluster_classifiers.keys()}
         else:
             cluster_weights = {k: v / s for k, v in cluster_weights.items()}
+        
         avg_state = self._weighted_average(cluster_classifiers, cluster_weights)
         if not self.classifier_momentum:
             self.classifier_momentum = {k: v.clone() for k, v in avg_state.items()}
@@ -89,3 +105,18 @@ class LayeredAggregator:
             for k, v in avg_state.items():
                 self.classifier_momentum[k] = beta * self.classifier_momentum.get(k, v) + (1 - beta) * v
         return self.classifier_momentum
+
+    def _build_weights(self, eval_results: dict, key_samples="train_samples", key_acc="global_accuracy", use_acc_weight=True, eps=1e-9):
+        """构建聚合权重，综合考虑样本数量和准确率"""
+        weights = {}
+        for cid, res in eval_results.items():
+            samples = max(float(res.get(key_samples, 1)), 1)  # 样本数，避免除零
+            w = samples
+            if use_acc_weight:
+                acc = max(float(res.get(key_acc, 0.0)), 0.0)
+                w *= (acc + eps)  # 精度权重，加epsilon避免零权重
+            weights[cid] = w
+        
+        # 归一化
+        s = sum(weights.values()) + eps
+        return {cid: w / s for cid, w in weights.items()}

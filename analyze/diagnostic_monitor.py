@@ -570,3 +570,59 @@ class EnhancedTierHFLDiagnosticMonitor:
             return max(0.0, min(1.0, stability_score))
         except:
             return 0.5
+
+@torch.no_grad()
+def compute_client_feature_similarity_robust(client_models, server_feature_extractor, sample_loader, device):
+    """修复版客户端特征相似度计算，确保每个客户端使用自己的本地特征提取路径"""
+    # 取一个小批次做对比
+    try:
+        images, _ = next(iter(sample_loader))
+        images = images.to(device)
+    except:
+        return 0.5  # 返回中性值如果无法获取数据
+
+    feats = []
+    for cid in sorted(client_models.keys()):
+        try:
+            cm = client_models[cid].to(device)
+            cm.eval()
+            
+            # 🔥 关键修复：使用客户端本地的共享/个性化特征，而不是统一的服务器特征
+            local_logits, shared_features, personal_features = cm(images)
+            
+            # 使用客户端共享层特征作为客户端特色表征
+            f_client = shared_features
+            
+            # 可选：如果有服务器特征提取器，再接上
+            if server_feature_extractor is not None:
+                f = server_feature_extractor(f_client)
+            else:
+                f = f_client
+                
+            # 展平 + L2 归一化，避免尺度影响
+            f = f.view(f.size(0), -1)
+            f = torch.nn.functional.normalize(f, dim=1)
+            
+            # 聚成一个 batch 的均值特征，用于客户端级别表示
+            feats.append(f.mean(dim=0))  # [D]
+            
+        except Exception as e:
+            # 如果某个客户端出错，跳过
+            continue
+    
+    if len(feats) < 2:
+        return 0.5  # 需要至少两个客户端才能计算相似度
+    
+    # 计算客户端间平均余弦相似度
+    F = torch.stack(feats, dim=0)  # [K, D]
+    sim = torch.mm(F, F.t()).clamp(-1, 1)  # 余弦：向量已归一化
+    
+    # 提取上三角矩阵（除去对角线）
+    upper_indices = torch.triu(torch.ones_like(sim), diagonal=1).bool()
+    upper_sim = sim[upper_indices]
+    
+    if len(upper_sim) == 0:
+        return 0.5
+        
+    avg_similarity = float(upper_sim.mean().item())
+    return avg_similarity
