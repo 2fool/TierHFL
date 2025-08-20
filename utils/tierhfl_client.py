@@ -53,21 +53,14 @@ class EnhancedFeatureAlignmentLoss(nn.Module):
             if debug_mode:
                 print(f"[Feature Loss DEBUG] 池化后服务器特征形状: {server_features.shape}")
         
-        # 统一特征维度
+        # 检查特征维度一致性 - 如果不一致说明模型架构有问题
         if client_features.size(1) != server_features.size(1):
             if debug_mode:
                 print(f"[Feature Loss DEBUG] 特征维度不匹配! 客户端: {client_features.size(1)}, 服务器: {server_features.size(1)}")
             
-            target_dim = min(client_features.size(1), server_features.size(1))
-            
-            if client_features.size(1) > target_dim:
-                client_features = client_features[:, :target_dim]
-            
-            if server_features.size(1) > target_dim:
-                server_features = server_features[:, :target_dim]
-                
-            if debug_mode:
-                print(f"[Feature Loss DEBUG] 调整后维度: {target_dim}")
+            # 🔥 不再裁切，而是报警告并返回零损失，避免信息损失
+            logging.warning(f"特征维度不匹配：客户端{client_features.size(1)} vs 服务器{server_features.size(1)}，跳过特征对齐损失计算")
+            return torch.tensor(0.0, device=client_features.device, requires_grad=True)
         
         # 标准化特征向量并检测异常值
         try:

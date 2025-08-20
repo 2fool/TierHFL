@@ -250,12 +250,12 @@ class EnhancedSerialTrainer:
                 elif training_phase == "alternating":
                     train_result = self._train_alternating_phase_enhanced(
                         client, client_model, cluster_server, cluster_classifier,
-                        round_idx, total_rounds, diagnostic_monitor)
+                        round_idx, total_rounds, diagnostic_monitor, args)
                     
                 else:  # fine_tuning
                     train_result = self._train_fine_tuning_phase_enhanced(
                         client, client_model, cluster_server, cluster_classifier,
-                        round_idx, total_rounds, diagnostic_monitor)
+                        round_idx, total_rounds, diagnostic_monitor, args)
                 
                 # 保存结果
                 train_results[client_id] = train_result
@@ -381,7 +381,7 @@ class EnhancedSerialTrainer:
         return {"train_loss": running_loss / max(1, len(client.train_data)), "train_acc": train_acc, "train_samples": train_samples}
 
     def _train_alternating_phase_enhanced(
-        self, client, client_model, server_model, classifier, round_idx, total_rounds, diagnostic_monitor=None
+        self, client, client_model, server_model, classifier, round_idx, total_rounds, diagnostic_monitor=None, args=None
     ):
         import time
         from torch.nn.utils import clip_grad_norm_
@@ -416,8 +416,13 @@ class EnhancedSerialTrainer:
         sch_global    = CosineAnnealingLR(opt_global,   T_max=max(1, client.local_epochs), eta_min=0.0)
 
         # 🔥 使用参数控制的动态alpha调整
-        progress = round_idx / max(1, total_rounds)
-        alpha = args.init_alpha - (args.init_alpha - args.min_alpha) * progress
+        if args is not None:
+            progress = round_idx / max(1, total_rounds)
+            alpha = args.init_alpha - (args.init_alpha - args.min_alpha) * progress
+        else:
+            # 回退到默认值
+            progress = round_idx / max(1, total_rounds)
+            alpha = 0.6 - (0.6 - 0.4) * progress
 
         stat = {'total_loss': 0.0, 'batch_count': 0, 'local_correct': 0, 'global_correct': 0, 'total': 0}
 
@@ -495,7 +500,7 @@ class EnhancedSerialTrainer:
     
     
     def _train_fine_tuning_phase_enhanced(self, client, client_model, server_model, global_classifier,
-                                          round_idx, total_rounds, diagnostic_monitor=None):
+                                          round_idx, total_rounds, diagnostic_monitor=None, args=None):
         import time
         from torch.nn.utils import clip_grad_norm_
         from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -523,8 +528,13 @@ class EnhancedSerialTrainer:
 
         stat = {'total_loss':0.0,'batch_count':0,'local_correct':0,'global_correct':0,'total':0}
         # 🔥 使用参数控制的动态alpha调整
-        progress = round_idx / max(1, total_rounds)
-        alpha = args.init_alpha - (args.init_alpha - args.min_alpha) * progress
+        if args is not None:
+            progress = round_idx / max(1, total_rounds)
+            alpha = args.init_alpha - (args.init_alpha - args.min_alpha) * progress
+        else:
+            # 回退到默认值
+            progress = round_idx / max(1, total_rounds)
+            alpha = 0.6 - (0.6 - 0.4) * progress
 
         train_loader = self._unwrap_loader(client.train_data)
 
@@ -972,6 +982,8 @@ def parse_arguments():
 
     parser.add_argument('--use_offline_wandb', default=0, type=int, help='是否使用离线wandb记录(1表示是)')
     parser.add_argument('--log_tag', default='', type=str, help='日志标签，用于区分不同实验')
+    parser.add_argument('--target_accuracy', default=None, type=float, help='目标精度，达到后立即停止训练(如60.0表示60%)')
+    parser.add_argument('--patience', default=15, type=int, help='早停耐心值，连续多少轮无改善后停止')
 
     parser.add_argument("--device", type=str, default="auto",
                     choices=["auto", "cuda", "cpu", "mps"],
@@ -1608,9 +1620,10 @@ def main():
     prev_global_acc = 0.0
     
     # 🔥 早停参数
-    patience = 15  # 15轮无改善则停止
+    patience = args.patience  # 使用参数配置的耐心值
     best_round = 0
     no_improve_count = 0
+    target_accuracy = args.target_accuracy  # 目标精度
     
     # 在训练开始前进行初始验证
     initial_validation = validate_server_effectiveness(
@@ -1697,6 +1710,12 @@ def main():
                 logger.info(f"保存最佳模型，准确率: {best_accuracy:.2f}%")
             except Exception as e:
                 logger.error(f"保存模型失败: {str(e)}")
+        
+        # 🔥 达标即停检查
+        if target_accuracy is not None and global_model_accuracy >= target_accuracy:
+            logger.info(f"达到目标精度 {target_accuracy:.1f}%! 当前精度: {global_model_accuracy:.2f}% (轮次 {round_idx+1})")
+            logger.info(f"提前停止训练，最佳精度: {best_accuracy:.2f}%")
+            break
         
         # 🔥 早停检查
         if global_model_accuracy > best_accuracy + 1e-4:  # 如果有显著改善
