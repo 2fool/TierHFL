@@ -100,7 +100,7 @@ class EnhancedSerialTrainer:
         self.global_classifier.to(self.device)
 
         self.use_amp = bool(use_amp and self.device.type == "cuda")
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp) if self.use_amp else None
 
         self.client_models = {}
         self.cluster_map = {}
@@ -112,10 +112,10 @@ class EnhancedSerialTrainer:
         self.layered_aggregator = LayeredAggregator(device=str(self.device))
 
         from utils.tierhfl_loss import EnhancedStagedLoss
-        # 🔥 GPT-5优化指导: ls_eps=0.1, entropy_coeff=1e-3
+        #  ls_eps=0.1, entropy_coeff=1e-3
         self.enhanced_loss = EnhancedStagedLoss(
-            ls_eps=0.1,       # GPT-5推荐: 标签平滑增强到0.1
-            entropy_coeff=1e-3  # GPT-5推荐: 熵正则降低到1e-3
+            ls_eps=0.1,       # 标签平滑增强到0.1
+            entropy_coeff=1e-3  #  熵正则降低到1e-3
         )
         
         # 客户端性能追踪（用于分层采样）
@@ -185,7 +185,7 @@ class EnhancedSerialTrainer:
         eval_results = {}
         shared_states = {}
         
-        # 确定当前训练阶段 - 按GPT-5建议的三阶段划分
+        # 确定当前训练阶段 
         if round_idx < args.initial_phase_rounds:
             training_phase = "initial"
             logging.info(f"轮次 {round_idx+1}/{total_rounds} - 初始阶段（仅训练server+global）")
@@ -390,11 +390,17 @@ class EnhancedSerialTrainer:
         client_model.to(self.device).train()
         server_model.to(self.device).train()
         classifier.to(self.device).train()
-        use_amp = (self.device.type == "cuda")
 
         # 允许全部分支训练（共享+个性化+本地头+服务器+全局头）
         for p in client_model.parameters():
             p.requires_grad = True
+        
+        # 保存共享层锚点用于FedProx
+        anchor_shared = {
+            n: p.detach().clone()
+            for n, p in client_model.named_parameters()
+            if 'shared_base' in n
+        }
 
         # 参数分组
         shared_params   = [p for n, p in client_model.named_parameters() if ('shared_base' in n and p.requires_grad)]
@@ -402,7 +408,7 @@ class EnhancedSerialTrainer:
         server_params   = list(server_model.parameters())
         global_params   = list(classifier.parameters())
 
-        # 🔥 GPT-5优化: 使用SGD with Nesterov, weight_decay=5e-4
+        # 使用SGD with Nesterov, weight_decay=5e-4
         opt_shared    = torch.optim.SGD(shared_params,   lr=client.lr, momentum=0.9, weight_decay=5e-4, nesterov=True) if shared_params else None
         opt_personal  = torch.optim.SGD(personal_params, lr=client.lr, momentum=0.9, weight_decay=5e-4, nesterov=True) if personal_params else None
         opt_server    = torch.optim.SGD(server_params,   lr=client.lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
@@ -422,80 +428,74 @@ class EnhancedSerialTrainer:
             progress = round_idx / max(1, total_rounds)
             alpha = 0.6 - (0.6 - 0.4) * progress
 
-        stat = {'total_loss': 0.0, 'batch_count': 0, 'local_correct': 0, 'global_correct': 0, 'total': 0}
+        # 获取MixUp/CutMix参数并添加调度
+        mx_alpha = getattr(args, "mixup_alpha", 0.0)
+        cm_alpha = getattr(args, "cutmix_alpha", 0.0)
+        aug_prob = getattr(args, "augment_prob", 0.5)
         
-        # 🔥 MixUp/CutMix设置
-        use_mixup = hasattr(args, 'mixup_alpha') and args.mixup_alpha > 0
-        use_cutmix = hasattr(args, 'cutmix_alpha') and args.cutmix_alpha > 0
-        augment_prob = getattr(args, 'augment_prob', 0.5)
+        # CutMix概率调度：前30轮保持0.6，然后线性衰减到0.3
+        if round_idx < 30:
+            cutmix_prob = 0.6
+        else:
+            # 线性衰减：从0.6衰减到0.3
+            cutmix_prob = 0.6 - (0.6 - 0.3) * (round_idx - 30) / (total_rounds - 30)
+            cutmix_prob = max(cutmix_prob, 0.3)
+        
+        # 交叉熵损失函数用于mix criterion
+        crit = torch.nn.CrossEntropyLoss()
+        
+        stat = {'total_loss': 0.0, 'batch_count': 0, 'local_correct': 0, 'global_correct': 0, 'total': 0}
 
         for _ in range(client.local_epochs):
             for data, target in client.train_data:
                 data   = data.to(self.device, non_blocking=True)
                 target = target.to(self.device, non_blocking=True)
                 
-                # 🔥 应用MixUp/CutMix数据增广
-                mixup_applied = False
-                y_a, y_b, lam = target, target, 1.0
+                # 应用MixUp/CutMix数据增广
+                use_mix = (mx_alpha > 0 or cm_alpha > 0) and (np.random.rand() < aug_prob)
                 
-                if (use_mixup or use_cutmix) and np.random.rand() < augment_prob:
-                    if use_mixup and use_cutmix:
-                        # 随机选择MixUp或CutMix
-                        if np.random.rand() < 0.5:
-                            data, y_a, y_b, lam = mixup_data(data, target, args.mixup_alpha, self.device)
-                        else:
-                            data, y_a, y_b, lam = cutmix_data(data, target, args.cutmix_alpha, self.device)
-                        mixup_applied = True
-                    elif use_mixup:
-                        data, y_a, y_b, lam = mixup_data(data, target, args.mixup_alpha, self.device)
-                        mixup_applied = True
-                    elif use_cutmix:
-                        data, y_a, y_b, lam = cutmix_data(data, target, args.cutmix_alpha, self.device)
-                        mixup_applied = True
+                if use_mix:
+                    if cm_alpha > 0 and np.random.rand() < cutmix_prob:
+                        data, ya, yb, lam = cutmix_data(data, target, cm_alpha)
+                    else:
+                        data, ya, yb, lam = mixup_data(data, target, mx_alpha)
+                else:
+                    ya = yb = target
+                    lam = 1.0
 
                 if opt_shared:   opt_shared.zero_grad(set_to_none=True)
                 if opt_personal: opt_personal.zero_grad(set_to_none=True)
                 opt_server.zero_grad(set_to_none=True)
                 opt_global.zero_grad(set_to_none=True)
 
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
                     local_logits, shared_features, personal_features = client_model(data)
                     server_features = server_model(shared_features)
                     global_logits   = classifier(server_features)
 
-                    if mixup_applied:
-                        # 🔥 手动计算MixUp/CutMix的混合损失
-                        # 分别计算对y_a和y_b的损失，然后按lam加权组合
-                        total_loss_a, local_loss_a, global_loss_a, balance_loss_a = self.enhanced_loss.stage2_3_loss(
-                            local_logits, global_logits, y_a,
-                            personal_gradients=None, global_gradients=None,
-                            shared_features=shared_features, alpha=alpha
-                        )
-                        total_loss_b, local_loss_b, global_loss_b, balance_loss_b = self.enhanced_loss.stage2_3_loss(
-                            local_logits, global_logits, y_b,
-                            personal_gradients=None, global_gradients=None,
-                            shared_features=shared_features, alpha=alpha
-                        )
-                        
-                        # 按lam加权组合损失
-                        total_loss = lam * total_loss_a + (1 - lam) * total_loss_b
-                        local_loss = lam * local_loss_a + (1 - lam) * local_loss_b
-                        global_loss = lam * global_loss_a + (1 - lam) * global_loss_b
-                        balance_loss = lam * balance_loss_a + (1 - lam) * balance_loss_b
-                    else:
-                        # 使用标准损失
-                        total_loss, local_loss, global_loss, balance_loss = self.enhanced_loss.stage2_3_loss(
-                            local_logits, global_logits, target,
-                            personal_gradients=None, global_gradients=None,
-                            shared_features=shared_features, alpha=alpha
-                        )
+                # 使用mix criterion计算损失
+                local_ce = mix_criterion(crit, local_logits, ya, yb, lam)
+                global_ce = mix_criterion(crit, global_logits, ya, yb, lam)
+
+                # 获取原EnhancedStagedLoss的其他组件
+                total_loss, _, _, balance_loss = self.enhanced_loss.stage2_3_loss(
+                    local_logits, global_logits, target,
+                    personal_gradients=None, global_gradients=None,
+                    shared_features=shared_features, alpha=alpha
+                )
                 
-                # 🔥 GPT-5优化: 添加FedProx正则化项 (μ=0.005)
+                # 替换CE部分为mix版本
+                total_loss = total_loss - self.enhanced_loss.ce_loss_local(local_logits, target)
+                from utils.tierhfl_loss import cross_entropy_ls
+                total_loss = total_loss - cross_entropy_ls(global_logits, target, eps=self.enhanced_loss.ls_eps)
+                total_loss = total_loss + local_ce + global_ce
+                
+                # 添加FedProx正则化项
                 if hasattr(self, 'mu') and self.mu > 0:
-                    prox_loss = self.compute_prox_loss(client_model, server_model, self.mu)
+                    prox_loss = self.compute_prox_loss(client_model, anchor_shared, self.mu)
                     total_loss += prox_loss
 
-                if use_amp:
+                if self.use_amp:
                     self.scaler.scale(total_loss).backward()
                     # 可选：共享层梯度投影
                     # self.enhanced_loss.apply_gradient_projection(client_model, local_loss, global_loss, alpha_stage=alpha)
@@ -523,12 +523,12 @@ class EnhancedSerialTrainer:
 
                 stat['total_loss']   += float(total_loss.item()); stat['batch_count'] += 1
                 with torch.no_grad():
-                    if mixup_applied:
+                    if lam < 1.0:  # MixUp/CutMix applied
                         # MixUp/CutMix时，使用混合准确率计算
                         pred_local = local_logits.argmax(1)
                         pred_global = global_logits.argmax(1)
-                        stat['local_correct'] += (lam * (pred_local == y_a).float() + (1 - lam) * (pred_local == y_b).float()).sum().item()
-                        stat['global_correct'] += (lam * (pred_global == y_a).float() + (1 - lam) * (pred_global == y_b).float()).sum().item()
+                        stat['local_correct'] += (lam * (pred_local == ya).float() + (1 - lam) * (pred_local == yb).float()).sum().item()
+                        stat['global_correct'] += (lam * (pred_global == ya).float() + (1 - lam) * (pred_global == yb).float()).sum().item()
                     else:
                         # 标准准确率计算
                         stat['local_correct']  += (local_logits.argmax(1)  == target).sum().item()
@@ -993,17 +993,17 @@ class EnhancedSerialTrainer:
         # 更新客户端性能指标
         perf['accuracy_ema'] = 0.8 * perf['accuracy_ema'] + 0.2 * accuracy
 
-    def compute_prox_loss(self, local_model, global_model, mu=0.0):
-        """计算FedProx正则化项"""
+    def compute_prox_loss(self, client_model, anchor_shared, mu=0.0):
+        """计算FedProx正则化项（仅限共享层）"""
         if mu <= 0:
             return 0.0
         
         prox_loss = 0.0
-        with torch.no_grad():
-            for local_param, global_param in zip(local_model.parameters(), global_model.parameters()):
-                prox_loss += torch.sum((local_param - global_param) ** 2)
+        for name, param in client_model.named_parameters():
+            if 'shared_base' in name and name in anchor_shared:
+                prox_loss += torch.sum((param - anchor_shared[name]) ** 2)
         
-        return mu / 2.0 * prox_loss
+        return (mu / 2.0) * prox_loss
 
 
 def set_seed(seed=42):
@@ -1014,60 +1014,38 @@ def set_seed(seed=42):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
 
-
-# === MixUp和CutMix数据增广实现 ===
-def mixup_data(x, y, alpha=0.4, device='cuda'):
-    """MixUp数据增广"""
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-
+def mixup_data(x, y, alpha):
+    import numpy as np, torch
+    if alpha <= 0:
+        return x, y, y, 1.0
+    lam = np.random.beta(alpha, alpha)
     batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(device)
-
+    index = torch.randperm(batch_size, device=x.device)
     mixed_x = lam * x + (1 - lam) * x[index, :]
     y_a, y_b = y, y[index]
     return mixed_x, y_a, y_b, lam
 
-
-def cutmix_data(x, y, alpha=1.0, device='cuda'):
-    """CutMix数据增广"""
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(device)
-
+def cutmix_data(x, y, alpha):
+    import numpy as np, torch
+    if alpha <= 0:
+        return x, y, y, 1.0
+    lam = np.random.beta(alpha, alpha)
+    batch_size, _, h, w = x.size()
+    index = torch.randperm(batch_size, device=x.device)
+    cx, cy = np.random.randint(w), np.random.randint(h)
+    cut_w = int(w * (1 - lam) ** 0.5)
+    cut_h = int(h * (1 - lam) ** 0.5)
+    x1 = np.clip(cx - cut_w // 2, 0, w)
+    y1 = np.clip(cy - cut_h // 2, 0, h)
+    x2 = np.clip(cx + cut_w // 2, 0, w)
+    y2 = np.clip(cy + cut_h // 2, 0, h)
+    x[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
     y_a, y_b = y, y[index]
-    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
-    x[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
-    
-    # 调整lambda为实际的面积比例
-    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
+    lam = 1 - (x2 - x1) * (y2 - y1) / (w * h)
     return x, y_a, y_b, lam
 
-
-def rand_bbox(size, lam):
-    """为CutMix生成随机边界框"""
-    W = size[2]
-    H = size[3]
-    cut_rat = np.sqrt(1. - lam)
-    cut_w = int(W * cut_rat)
-    cut_h = int(H * cut_rat)
-
-    # 随机选择中心点
-    cx = np.random.randint(W)
-    cy = np.random.randint(H)
-
-    bbx1 = np.clip(cx - cut_w // 2, 0, W)
-    bby1 = np.clip(cy - cut_h // 2, 0, H)
-    bbx2 = np.clip(cx + cut_w // 2, 0, W)
-    bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-    return bbx1, bby1, bbx2, bby2
+def mix_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
 def should_early_stop(round_idx, training_phase, acc, es_state, args):
@@ -1145,7 +1123,7 @@ def parse_arguments():
     # 联邦学习相关参数
     parser.add_argument('--client_epoch', default=5, type=int, help='客户端本地训练轮数')
     parser.add_argument('--client_number', type=int, default=5, help='客户端数量')
-    parser.add_argument('--batch_size', type=int, default=128, help='训练的输入批次大小 (GPT-5推荐: 128 for T4)')
+    parser.add_argument('--batch_size', type=int, default=128, help='训练的输入批次大小 ')
     parser.add_argument('--rounds', default=100, type=int, help='联邦学习轮数')
     parser.add_argument('--n_clusters', default=3, type=int, help='客户端聚类数量')
     
@@ -1155,12 +1133,12 @@ def parse_arguments():
     parser.add_argument('--init_lambda', default=0.15, type=float, help='初始特征对齐损失权重')
     parser.add_argument('--beta', default=0.3, type=float, help='聚合动量因子')
     
-    # 分层采样参数 (GPT-5优化指导)
-    parser.add_argument('--client_fraction', default=0.8, type=float, help='每轮参与训练的客户端比例(0-1) - GPT-5推荐: 0.8')
+    # 分层采样参数 
+    parser.add_argument('--client_fraction', default=0.8, type=float, help='每轮参与训练的客户端比例(0-1)')
     parser.add_argument('--retier_interval', default=10, type=int, help='每隔多少轮重新分层/聚类')
-    parser.add_argument('--mu', default=0.005, type=float, help='FedProx正则化系数 - GPT-5推荐: 0.005')
+    parser.add_argument('--mu', default=0.005, type=float, help='FedProx正则化系数 ')
     
-    # 训练阶段参数 - 根据GPT-5建议优化配比
+    # 训练阶段参数 
     parser.add_argument('--initial_feature_rounds', default=0, type=int, help='初始特征学习阶段轮数(建议设为总轮数10%)')
     parser.add_argument('--initial_phase_rounds', default=0, type=int, help='初始阶段轮数(若为0则自动计算为总轮数8%)')
     parser.add_argument('--alternating_phase_rounds', default=0, type=int, help='交替训练阶段轮数(若为0则自动计算为总轮数70%)')
@@ -1176,11 +1154,10 @@ def parse_arguments():
     parser.add_argument('--ignore_initial_phase_in_es', type=int, default=1, help='是否忽略初始阶段的早停判断')
     parser.add_argument('--min_rounds_before_es', type=int, default=30, help='开始早停判断的最小轮数')
     
-    # 数据增广参数 (GPT-5优化指导)
-    parser.add_argument('--mixup_alpha', default=0.4, type=float, help='MixUp的alpha参数(0表示关闭MixUp) - GPT-5推荐: 0.4')
-    parser.add_argument('--cutmix_alpha', default=1.0, type=float, help='CutMix的alpha参数(0表示关闭CutMix) - GPT-5推荐: 1.0')
-    parser.add_argument('--cutmix_prob', default=0.6, type=float, help='CutMix应用概率 - GPT-5推荐: 0.6')
-    parser.add_argument('--augment_prob', default=0.5, type=float, help='应用MixUp/CutMix的概率')
+    # 数据增广参数 
+    parser.add_argument('--mixup_alpha', default=0.4, type=float, help='MixUp的alpha参数(0表示关闭MixUp)')
+    parser.add_argument('--cutmix_alpha', default=1.0, type=float, help='CutMix的alpha参数(0表示关闭CutMix)')
+    parser.add_argument('--augment_prob', default=0.6, type=float, help='应用MixUp/CutMix的概率')
 
     parser.add_argument("--device", type=str, default="auto",
                     choices=["auto", "cuda", "cpu", "mps"],
@@ -1224,12 +1201,13 @@ def setup_wandb(args):
             group=f"{args.model}_{args.dataset}"
         )
         # 自定义面板
-        wandb.define_metric("round")
-        wandb.define_metric("global/*", step_metric="round")
-        wandb.define_metric("local/*", step_metric="round")
-        wandb.define_metric("client/*", step_metric="round")
-        wandb.define_metric("time/*", step_metric="round")
-        wandb.define_metric("params/*", step_metric="round")
+        if getattr(wandb, "run", None):
+            wandb.define_metric("round")
+            wandb.define_metric("global/*", step_metric="round")
+            wandb.define_metric("local/*", step_metric="round")
+            wandb.define_metric("client/*", step_metric="round")
+            wandb.define_metric("time/*", step_metric="round")
+            wandb.define_metric("params/*", step_metric="round")
         logger.info(f"wandb 初始化完成（{mode}）。")
     except Exception as e:
         logger.warning(f"wandb 初始化失败: {e}")
@@ -1897,14 +1875,15 @@ def main():
         logger.info("使用分层聚合策略聚合模型...")
         aggregation_start_time = time.time()
         
-        # 聚合客户端共享层
-        aggregated_shared_state = trainer.aggregate_client_shared_layers(shared_states, eval_results)
+        # 聚合客户端共享层 (前20轮使用均匀权重warmup)
+        warmup_eval_results = None if round_idx < 20 else eval_results
+        aggregated_shared_state = trainer.aggregate_client_shared_layers(shared_states, warmup_eval_results)
         
         # 聚合服务器模型
-        aggregated_server_model = trainer.aggregate_server_models(eval_results)
+        aggregated_server_model = trainer.aggregate_server_models(warmup_eval_results)
 
         # 聚合全局分类器
-        aggregated_global_classifier = trainer.aggregate_global_classifiers(eval_results)
+        aggregated_global_classifier = trainer.aggregate_global_classifiers(warmup_eval_results)
         
         # 更新模型
         logger.info("更新客户端共享层...")
@@ -1959,7 +1938,7 @@ def main():
         # 🔥 早停判断
         if should_stop:
             logger.info(f"早停触发! 已连续{es_state['bad']}轮无显著改善(>{args.min_delta}%)")
-            logger.info(f"最佳准确率: {es_state['best']:.2f}% (轮次 {es_state['last_improve_round']+1})")
+            logger.info(f"最佳准确率: {best_accuracy:.2f}% (轮次 {es_state['last_improve_round']+1})")
             break
         
         # 计算轮次时间
@@ -1969,11 +1948,11 @@ def main():
         logger.info(f"轮次 {round_idx+1} 统计:")
         logger.info(f"本地平均准确率: {avg_local_acc:.2f}%, 全局平均准确率: {avg_global_acc:.2f}%")
         logger.info(f"全局模型在独立测试集上的准确率: {global_model_accuracy:.2f}%")
-        logger.info(f"最佳准确率: {es_state['best']:.2f}%")
+        logger.info(f"最佳准确率: {best_accuracy:.2f}%")
         logger.info(f"轮次总时间: {round_time:.2f}秒, 训练: {training_time:.2f}秒, 聚合: {aggregation_time:.2f}秒")
         
         # 🔥 详细的早停状态日志
-        logger.info(f"[ES] 阶段={current_phase} 精度={global_model_accuracy:.2f} 最佳={es_state['best']:.2f} "
+        logger.info(f"[ES] 阶段={current_phase} 精度={global_model_accuracy:.2f} 最佳={best_accuracy:.2f} "
                    f"无改善轮数={es_state['bad']}/{args.patience} 最小提升阈值={args.min_delta}% "
                    f"最小轮数门槛={args.min_rounds_before_es}")
         
@@ -2037,7 +2016,8 @@ def main():
                 avg_balance_loss = np.mean([result.get('balance_loss', 0) for result in train_results.values()])
                 metrics["training/avg_balance_loss"] = avg_balance_loss
             
-            wandb.log(metrics)
+            if getattr(wandb, "run", None) is not None:
+                wandb.log(metrics)
         except Exception as e:
             logger.error(f"记录wandb指标失败: {str(e)}")
         
@@ -2090,7 +2070,7 @@ def main():
                 logger.info(f"轮次 {round_idx+1} 客户端特征平均相似度: {similarity:.4f}")
                 
                 # 记录到wandb
-                if wandb.run:
+                if getattr(wandb, "run", None) is not None:
                     wandb.log({"diagnostic/feature_similarity": similarity, "round": round_idx + 1})
                     
             except Exception as e:
@@ -2098,12 +2078,13 @@ def main():
             
             # 记录验证结果
             try:
-                wandb.log({
-                    "round": round_idx + 1,
-                    "validation/feature_quality": round_validation['feature_quality'],
-                    "validation/heterogeneity_adaptation": round_validation['heterogeneity_adaptation'],
-                    "validation/simple_classifier_acc": round_validation['simple_classifier_acc']
-                })
+                if getattr(wandb, "run", None) is not None:
+                    wandb.log({
+                        "round": round_idx + 1,
+                        "validation/feature_quality": round_validation['feature_quality'],
+                        "validation/heterogeneity_adaptation": round_validation['heterogeneity_adaptation'],
+                        "validation/simple_classifier_acc": round_validation['simple_classifier_acc']
+                    })
             except Exception as e:
                 logger.error(f"记录wandb验证指标失败: {str(e)}")
     
