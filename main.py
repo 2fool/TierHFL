@@ -116,6 +116,12 @@ class EnhancedSerialTrainer:
             ls_eps=0.05,       # 降低标签平滑，减少小类信息被抹平
             entropy_coeff=2e-3  # 增强全局头的输出熵约束，防止单类偏好
         )
+        
+        # 客户端性能追踪（用于分层采样）
+        self.client_performance = defaultdict(lambda: {'speed_score': 1.0, 'accuracy_ema': 0.0})
+        
+        # FedProx参数
+        self.mu = 0.0  # 将在main函数中设置
 
     def _prepare_models_for_round(self, server_model, global_classifier):
         """本轮只调用一次，把聚合后的权重复制到trainer持有的模型上"""
@@ -163,6 +169,16 @@ class EnhancedSerialTrainer:
             
             lr_analysis = diagnostic_monitor.monitor_learning_rates(client_lrs, round_idx)
 
+        # 🔥 分层采样选择本轮参与的客户端
+        selected_cluster_map = self.select_clients_for_round(
+            self.cluster_map, args.client_fraction, round_idx
+        )
+        
+        # 统计选择的客户端数量
+        total_selected = sum(len(clients) for clients in selected_cluster_map.values())
+        total_available = sum(len(clients) for clients in self.cluster_map.values())
+        logging.info(f"分层采样：选择了 {total_selected}/{total_available} 个客户端参与训练")
+
         # 结果容器
         train_results = {}
         eval_results = {}
@@ -179,8 +195,8 @@ class EnhancedSerialTrainer:
             training_phase = "fine_tuning"
             logging.info(f"轮次 {round_idx+1}/{total_rounds} - 精细调整阶段")
         
-        # 依次处理每个聚类
-        for cluster_id, client_ids in self.cluster_map.items():
+        # 依次处理每个聚类（使用选择后的客户端）
+        for cluster_id, client_ids in selected_cluster_map.items():
             logging.info(f"处理聚类 {cluster_id}, 包含 {len(client_ids)} 个客户端")
             
             # 创建聚类特定的模型
@@ -240,6 +256,11 @@ class EnhancedSerialTrainer:
                 
                 # 保存结果
                 train_results[client_id] = train_result
+                
+                # 🔥 更新客户端性能指标
+                training_time = train_result.get('time_cost', 1.0)
+                accuracy = train_result.get('global_accuracy', train_result.get('local_accuracy', 0.0))
+                self.update_client_performance(client_id, training_time, accuracy)
                 
                 # 评估客户端
                 eval_result = self._evaluate_client(
@@ -813,6 +834,80 @@ class EnhancedSerialTrainer:
         
         return updated
 
+    def select_clients_for_round(self, cluster_map, client_fraction=0.7, round_idx=0):
+        """分层采样选择本轮参与训练的客户端"""
+        selected_cluster_map = {}
+        
+        for cluster_id, client_ids in cluster_map.items():
+            if len(client_ids) == 0:
+                selected_cluster_map[cluster_id] = []
+                continue
+                
+            # 计算该聚类中应选择的客户端数量
+            k = max(1, int(len(client_ids) * client_fraction))
+            
+            if k >= len(client_ids):
+                # 如果需要选择的数量大于等于总数，选择所有客户端
+                selected_cluster_map[cluster_id] = client_ids
+            else:
+                # 基于tier和performance进行加权采样
+                weights = []
+                for cid in client_ids:
+                    client = self.client_manager.get_client(cid)
+                    if client:
+                        # 基础权重：tier越高权重越大(tier=1最高，tier=4最低)
+                        tier_weight = 5 - client.tier  # tier 1->4, tier 2->3, tier 3->2, tier 4->1
+                        
+                        # 性能权重：基于最近的速度和准确率
+                        perf = self.client_performance[cid]
+                        speed_weight = perf['speed_score'] 
+                        acc_weight = perf['accuracy_ema'] + 0.1  # 加0.1避免零权重
+                        
+                        # 综合权重
+                        total_weight = tier_weight * speed_weight * acc_weight
+                        weights.append(max(total_weight, 0.01))  # 确保最小权重
+                    else:
+                        weights.append(0.01)
+                
+                # 归一化权重
+                weights = np.array(weights)
+                weights = weights / weights.sum()
+                
+                # 加权随机采样
+                try:
+                    selected_indices = np.random.choice(
+                        len(client_ids), size=k, replace=False, p=weights
+                    )
+                    selected_cluster_map[cluster_id] = [client_ids[i] for i in selected_indices]
+                except:
+                    # 如果采样失败，退回到随机采样
+                    selected_cluster_map[cluster_id] = np.random.choice(client_ids, size=k, replace=False).tolist()
+        
+        return selected_cluster_map
+    
+    def update_client_performance(self, client_id, training_time, accuracy):
+        """更新客户端性能指标"""
+        perf = self.client_performance[client_id]
+        
+        # 更新速度得分(EMA)
+        speed_score = 1.0 / (training_time + 1e-6)  # 时间越短得分越高
+        perf['speed_score'] = 0.8 * perf['speed_score'] + 0.2 * speed_score
+        
+        # 更新客户端性能指标
+        perf['accuracy_ema'] = 0.8 * perf['accuracy_ema'] + 0.2 * accuracy
+
+    def compute_prox_loss(self, local_model, global_model, mu=0.0):
+        """计算FedProx正则化项"""
+        if mu <= 0:
+            return 0.0
+        
+        prox_loss = 0.0
+        with torch.no_grad():
+            for local_param, global_param in zip(local_model.parameters(), global_model.parameters()):
+                prox_loss += torch.sum((local_param - global_param) ** 2)
+        
+        return mu / 2.0 * prox_loss
+
 
 def set_seed(seed=42):
     import random, numpy as np, torch
@@ -855,6 +950,11 @@ def parse_arguments():
     parser.add_argument('--init_alpha', default=0.6, type=float, help='初始本地与全局损失平衡因子')
     parser.add_argument('--init_lambda', default=0.15, type=float, help='初始特征对齐损失权重')
     parser.add_argument('--beta', default=0.3, type=float, help='聚合动量因子')
+    
+    # 分层采样参数
+    parser.add_argument('--client_fraction', default=0.7, type=float, help='每轮参与训练的客户端比例(0-1)')
+    parser.add_argument('--retier_interval', default=10, type=int, help='每隔多少轮重新分层/聚类')
+    parser.add_argument('--mu', default=0.0, type=float, help='FedProx正则化系数(0表示关闭)')
 
     parser.add_argument("--device", type=str, default="auto",
                     choices=["auto", "cuda", "cpu", "mps"],
@@ -1129,9 +1229,15 @@ def load_global_test_set(args):
 
 def evaluate_global_model_multi_client(client_models, server_model, global_classifier, global_test_loader, device, num_eval_clients=3):
     """🔥 使用多个客户端进行全局模型评估，提高评估稳健性"""
-    # 选择多个客户端进行评估
+    # 随机选择多个客户端进行评估，避免固定选择前几个造成偏差
     client_ids = list(client_models.keys())
-    eval_client_ids = client_ids[:min(num_eval_clients, len(client_ids))]
+    
+    if len(client_ids) <= num_eval_clients:
+        eval_client_ids = client_ids  # 如果客户端数量不多，全部评估
+    else:
+        # 随机采样，确保评估的多样性
+        import random
+        eval_client_ids = random.sample(client_ids, num_eval_clients)
     
     all_accuracies = []
     
@@ -1398,14 +1504,14 @@ def main():
     logger.info("创建服务器特征提取模型...")
     server_model = EnhancedServerModel(
         model_type=args.model,
-        feature_dim=256,  # 从128提升到256，提升CIFAR-100表征能力
+        feature_dim=384,  # 🔥 从256提升到384，进一步提升CIFAR-100表征能力
         input_channels=input_channels  # 添加输入通道参数
     ).to(device)
     
     # 创建全局分类器
     logger.info("创建全局分类器...")
     global_classifier = ImprovedGlobalClassifier(
-        feature_dim=256,  # 从128提升到256，匹配服务器特征维度
+        feature_dim=384,  # 🔥 从256提升到384，匹配服务器特征维度
         num_classes=class_num
     ).to(device)
     
@@ -1433,6 +1539,9 @@ def main():
         device=str(device),
         use_amp=args.amp
     )
+    
+    # 🔥 设置FedProx正则化系数
+    trainer.mu = args.mu
 
     
     # 注册客户端模型
@@ -1445,10 +1554,38 @@ def main():
     logger.info("创建诊断监控器...")
     diagnostic_monitor = EnhancedTierHFLDiagnosticMonitor(device='cpu')
     
+    # 🔥 创建全局学习率调度器（跨轮Cosine调度）
+    # 收集服务器模型和全局分类器的参数用于全局调度
+    global_params = list(server_model.parameters()) + list(global_classifier.parameters())
+    global_optimizer = torch.optim.SGD(
+        global_params, lr=args.lr, momentum=0.9, weight_decay=5e-4, nesterov=True
+    )
+    
+    # Cosine学习率调度，带5轮warmup
+    def cosine_lr_with_warmup(optimizer, current_round, total_rounds, warmup_rounds=5, eta_min=1e-4):
+        if current_round < warmup_rounds:
+            # Warmup阶段：线性增长到初始学习率
+            lr_factor = (current_round + 1) / warmup_rounds
+        else:
+            # Cosine退火阶段
+            progress = (current_round - warmup_rounds) / (total_rounds - warmup_rounds)
+            lr_factor = 0.5 * (1 + np.cos(np.pi * progress))
+            lr_factor = max(lr_factor, eta_min / args.lr)  # 确保不低于eta_min
+        
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = args.lr * lr_factor
+        
+        return args.lr * lr_factor
+    
     # 开始训练循环
     logger.info(f"开始联邦学习训练 ({args.rounds} 轮)...")
     best_accuracy = 0.0
     prev_global_acc = 0.0
+    
+    # 🔥 早停参数
+    patience = 15  # 15轮无改善则停止
+    best_round = 0
+    no_improve_count = 0
     
     # 在训练开始前进行初始验证
     initial_validation = validate_server_effectiveness(
@@ -1535,6 +1672,22 @@ def main():
                 logger.info(f"保存最佳模型，准确率: {best_accuracy:.2f}%")
             except Exception as e:
                 logger.error(f"保存模型失败: {str(e)}")
+        
+        # 🔥 早停检查
+        if global_model_accuracy > best_accuracy + 1e-4:  # 如果有显著改善
+            best_accuracy = global_model_accuracy
+            best_round = round_idx
+            no_improve_count = 0
+            logger.info(f"新的最佳准确率: {best_accuracy:.2f}% (轮次 {round_idx+1})")
+        else:
+            no_improve_count += 1
+            logger.info(f"无改善计数: {no_improve_count}/{patience}")
+        
+        # 判断是否需要早停
+        if no_improve_count >= patience:
+            logger.info(f"早停触发! 已连续{patience}轮无改善")
+            logger.info(f"最佳准确率: {best_accuracy:.2f}% (轮次 {best_round+1})")
+            break
         
         # 计算轮次时间
         round_time = time.time() - round_start_time
@@ -1624,13 +1777,20 @@ def main():
             except Exception as e:
                 logger.error(f"重新聚类失败: {str(e)}")
         
-        # 动态学习率调整
-        if round_idx > 0 and round_idx % 10 == 0:
-            for client_id in range(args.client_number):
-                client = client_manager.get_client(client_id)
-                if client:
-                    client.lr *= args.lr_factor
-                    logger.info(f"客户端 {client_id} 学习率更新为: {client.lr:.6f}")
+        # 🔥 全局Cosine学习率调度
+        current_global_lr = cosine_lr_with_warmup(
+            global_optimizer, round_idx, args.rounds, warmup_rounds=5, eta_min=1e-4
+        )
+        
+        # 同步客户端学习率（可选择性地设置为全局学习率的一定比例）
+        client_lr_ratio = 1.0  # 客户端与全局学习率的比例
+        for client_id in range(args.client_number):
+            client = client_manager.get_client(client_id)
+            if client:
+                client.lr = current_global_lr * client_lr_ratio
+        
+        if round_idx % 10 == 0:  # 每10轮记录一次学习率
+            logger.info(f"轮次 {round_idx+1}: 全局学习率={current_global_lr:.6f}, 客户端学习率={current_global_lr * client_lr_ratio:.6f}")
 
         # 每隔5轮进行一次服务器有效性验证
         if (round_idx + 1) % 5 == 0:

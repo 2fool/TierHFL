@@ -84,11 +84,16 @@ def _data_transforms_cifar100():
         transforms.ToPILImage(),
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
+        # 🔥 更强的数据增广：AutoAugment
+        transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10),  # CIFAR10 policy也适用于CIFAR100
         transforms.ToTensor(),
         transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+        # 🔥 RandomErasing替代Cutout，提供更多样的遮挡
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
     ])
 
-    train_transform.transforms.append(Cutout(16))
+    # 移除原来的Cutout，因为已经用RandomErasing替代了
+    # train_transform.transforms.append(Cutout(16))
 
     valid_transform = transforms.Compose([
         transforms.ToTensor(),

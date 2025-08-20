@@ -82,35 +82,35 @@ class TierAwareClientModel(nn.Module):
     Output of forward: local_logits, shared_features, personal_features
 
     Design target for CIFAR-style inputs (3x32x32):
-      shared features channel = 32  (kept stable for server-side input)
+      shared features channel = 48 (🔥 增加从32到48，提升表示能力)
     """
     def __init__(self, input_channels: int = 3, num_classes: int = 100):
         super().__init__()
 
-        # ---- Shared trunk: 3 -> 32 channels, keep spatial ~32x32
+        # ---- Shared trunk: 3 -> 48 channels (🔥 从32增加到48), keep spatial ~32x32
         self.shared_base = nn.Sequential(
-            conv3x3(input_channels, 32, stride=1),
-            LayerNormCNN(32),
+            conv3x3(input_channels, 48, stride=1),  # 🔥 32 -> 48
+            LayerNormCNN(48),
             nn.GELU(),
-            BasicBlock(32, 32, stride=1, downsample=None),
-            BasicBlock(32, 32, stride=1, downsample=None),
+            BasicBlock(48, 48, stride=1, downsample=None),  # 🔥 32 -> 48
+            BasicBlock(48, 48, stride=1, downsample=None),  # 🔥 32 -> 48
         )
 
-        # ---- Personalized branch: keep 32 channels; you can deepen if needed
+        # ---- Personalized branch: keep 48 channels; you can deepen if needed
         self.personalized_path = nn.Sequential(
-            BasicBlock(32, 32, stride=1, downsample=None),
-            BasicBlock(32, 32, stride=1, downsample=None),
+            BasicBlock(48, 48, stride=1, downsample=None),  # 🔥 32 -> 48
+            BasicBlock(48, 48, stride=1, downsample=None),  # 🔥 32 -> 48
         )
 
         # ---- Local classifier head (BN-free, mild MLP)
         self.local_classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),                # 32
-            nn.LayerNorm(32),
-            nn.Linear(32, 64),
+            nn.Flatten(),                # 48 (🔥 从32增加到48)
+            nn.LayerNorm(48),            # 🔥 32 -> 48
+            nn.Linear(48, 96),           # 🔥 32->64 变为 48->96
             nn.GELU(),
             nn.Dropout(0.1),             # reduced from 0.3 to mitigate early collapse
-            nn.Linear(64, num_classes),
+            nn.Linear(96, num_classes),  # 🔥 64 -> 96
         )
 
         self._init_weights()
@@ -133,8 +133,8 @@ class TierAwareClientModel(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        shared = self.shared_base(x)                # [B, 32, H, W]  (H,W ~32)
-        personal = self.personalized_path(shared)   # [B, 32, H, W]
+        shared = self.shared_base(x)                # [B, 48, H, W]  (H,W ~32) 🔥 从32改为48
+        personal = self.personalized_path(shared)   # [B, 48, H, W]  🔥 从32改为48
         local_logits = self.local_classifier(personal)
         return local_logits, shared, personal
 
@@ -143,22 +143,22 @@ class TierAwareClientModel(nn.Module):
 # -----------------------------
 class EnhancedServerModel(nn.Module):
     """
-    Server continues from client shared_features (B, 32, H, W)
-    and ups the channels to 64 with stride=2 residual stage,
+    Server continues from client shared_features (B, 48, H, W) 🔥 从32改为48
+    and ups the channels to 96 🔥 从64改为96 with stride=2 residual stage,
     then projects to feature_dim.
 
     NOTE: Proper downsample for residual path is handled via _make_layer.
     """
-    def __init__(self, model_type: str = 'resnet56', feature_dim: int = 128,
+    def __init__(self, model_type: str = 'resnet56', feature_dim: int = 384,  # 🔥 从128改为384
                  input_channels: int = 3, **kwargs):
         super().__init__()
-        # one stage: 32 -> 64, downsample spatial by 2
-        self.stage = self._make_layer(BasicBlock, in_planes=32, out_planes=64, blocks=3, stride=2)
+        # one stage: 48 -> 96, downsample spatial by 2  🔥 从32->64改为48->96
+        self.stage = self._make_layer(BasicBlock, in_planes=48, out_planes=96, blocks=3, stride=2)  # 🔥 32->48, 64->96
         self.proj = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.LayerNorm(64),
-            nn.Linear(64, feature_dim),
+            nn.LayerNorm(96),            # 🔥 从64改为96
+            nn.Linear(96, feature_dim),  # 🔥 从64改为96
         )
         self._init_weights()
 
@@ -191,7 +191,7 @@ class EnhancedServerModel(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, shared_features):
-        x = self.stage(shared_features)  # -> [B, 64, H/2, W/2]
+        x = self.stage(shared_features)  # -> [B, 96, H/2, W/2]  🔥 从64改为96
         x = self.proj(x)                 # -> [B, feature_dim]
         return x
 
@@ -202,7 +202,7 @@ class ImprovedGlobalClassifier(nn.Module):
     """
     Global head taking server feature vectors. Supports class_num alias.
     """
-    def __init__(self, feature_dim: int = 128, num_classes: int = 100, class_num=None, **kwargs):
+    def __init__(self, feature_dim: int = 384, num_classes: int = 100, class_num=None, **kwargs):  # 🔥 从128改为384
         super().__init__()
         if class_num is not None:
             num_classes = class_num
