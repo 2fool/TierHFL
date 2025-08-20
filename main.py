@@ -185,9 +185,12 @@ class EnhancedSerialTrainer:
         shared_states = {}
         
         # 确定当前训练阶段 - 使用参数化边界而非硬编码
-        if round_idx < args.initial_phase_rounds:
+        if round_idx < args.initial_feature_rounds:  # 🔥 使用initial_feature_rounds参数
             training_phase = "initial"
             logging.info(f"轮次 {round_idx+1}/{total_rounds} - 初始特征学习阶段")
+        elif round_idx < args.initial_phase_rounds:
+            training_phase = "initial"
+            logging.info(f"轮次 {round_idx+1}/{total_rounds} - 初始阶段")
         elif round_idx < args.initial_phase_rounds + args.alternating_phase_rounds:
             training_phase = "alternating"
             logging.info(f"轮次 {round_idx+1}/{total_rounds} - 交替训练阶段")
@@ -412,7 +415,9 @@ class EnhancedSerialTrainer:
         sch_server    = CosineAnnealingLR(opt_server,   T_max=max(1, client.local_epochs), eta_min=0.0)
         sch_global    = CosineAnnealingLR(opt_global,   T_max=max(1, client.local_epochs), eta_min=0.0)
 
-        alpha = 0.5 + 0.2 * min(1.0, round_idx / max(1, total_rounds))  # 例：随轮次略偏向本地
+        # 🔥 使用参数控制的动态alpha调整
+        progress = round_idx / max(1, total_rounds)
+        alpha = args.init_alpha - (args.init_alpha - args.min_alpha) * progress
 
         stat = {'total_loss': 0.0, 'batch_count': 0, 'local_correct': 0, 'global_correct': 0, 'total': 0}
 
@@ -517,7 +522,9 @@ class EnhancedSerialTrainer:
         sch_global   = CosineAnnealingLR(opt_global,   T_max=max(1, client.local_epochs), eta_min=0.0)
 
         stat = {'total_loss':0.0,'batch_count':0,'local_correct':0,'global_correct':0,'total':0}
-        alpha = min(0.9, 0.6 + 0.3 * round_idx / max(1, total_rounds))  # 更偏本地
+        # 🔥 使用参数控制的动态alpha调整
+        progress = round_idx / max(1, total_rounds)
+        alpha = args.init_alpha - (args.init_alpha - args.min_alpha) * progress
 
         train_loader = self._unwrap_loader(client.train_data)
 
@@ -948,6 +955,7 @@ def parse_arguments():
     
     # TierHFL特有参数
     parser.add_argument('--init_alpha', default=0.6, type=float, help='初始本地与全局损失平衡因子')
+    parser.add_argument('--min_alpha', default=0.4, type=float, help='最小本地与全局损失平衡因子')
     parser.add_argument('--init_lambda', default=0.15, type=float, help='初始特征对齐损失权重')
     parser.add_argument('--beta', default=0.3, type=float, help='聚合动量因子')
     
@@ -955,6 +963,15 @@ def parse_arguments():
     parser.add_argument('--client_fraction', default=0.7, type=float, help='每轮参与训练的客户端比例(0-1)')
     parser.add_argument('--retier_interval', default=10, type=int, help='每隔多少轮重新分层/聚类')
     parser.add_argument('--mu', default=0.0, type=float, help='FedProx正则化系数(0表示关闭)')
+    
+    # 训练阶段参数
+    parser.add_argument('--initial_feature_rounds', default=5, type=int, help='初始特征学习阶段轮数')
+    parser.add_argument('--initial_phase_rounds', default=2, type=int, help='初始阶段轮数')
+    parser.add_argument('--alternating_phase_rounds', default=0, type=int, help='交替训练阶段轮数(0表示自动计算)')
+    parser.add_argument('--fine_tuning_phase_rounds', default=0, type=int, help='精细调整阶段轮数')
+
+    parser.add_argument('--use_offline_wandb', default=0, type=int, help='是否使用离线wandb记录(1表示是)')
+    parser.add_argument('--log_tag', default='', type=str, help='日志标签，用于区分不同实验')
 
     parser.add_argument("--device", type=str, default="auto",
                     choices=["auto", "cuda", "cpu", "mps"],
@@ -980,13 +997,21 @@ def setup_wandb(args):
     """仅负责初始化 wandb，不再动 logging 的 handler。"""
     logger = logging.getLogger("TierHFL")
     try:
+        # 🔥 使用参数控制wandb模式和标签
+        mode = "offline" if args.use_offline_wandb == 1 else "online"
+        
+        # 构建动态标签
+        tags = [f"model_{args.model}", f"dataset_{args.dataset}",
+               f"clients_{args.client_number}", f"partition_{args.partition_method}"]
+        if args.log_tag:
+            tags.append(args.log_tag)
+            
         wandb.init(
-            mode="offline",
+            mode=mode,
             project="TierHFL_Enhanced",
             name=args.running_name,
             config=vars(args),
-            tags=[f"model_{args.model}", f"dataset_{args.dataset}",
-                  f"clients_{args.client_number}", f"partition_{args.partition_method}"],
+            tags=tags,
             group=f"{args.model}_{args.dataset}"
         )
         # 自定义面板
@@ -996,7 +1021,7 @@ def setup_wandb(args):
         wandb.define_metric("client/*", step_metric="round")
         wandb.define_metric("time/*", step_metric="round")
         wandb.define_metric("params/*", step_metric="round")
-        logger.info("wandb 初始化完成（offline）。")
+        logger.info(f"wandb 初始化完成（{mode}）。")
     except Exception as e:
         logger.warning(f"wandb 初始化失败: {e}")
         try:
@@ -1409,10 +1434,10 @@ def main():
     # 解析命令行参数
     args = parse_arguments()
 
-    # 添加新参数（如果你这几行就是手动给默认值，也可以保留）
-    args.initial_phase_rounds = 2      # 🔥 关键修复：从10轮改为2轮，尽快进入alternating阶段
-    args.alternating_phase_rounds = 198 # 🔥 让主体训练落在alternating阶段
-    args.fine_tuning_phase_rounds = 0  # 精细调整阶段轮数（可先设 0）
+    # 🔥 训练阶段轮数自动计算（如果未指定）
+    if args.alternating_phase_rounds == 0:
+        args.alternating_phase_rounds = args.rounds - args.initial_phase_rounds - args.fine_tuning_phase_rounds
+        args.alternating_phase_rounds = max(1, args.alternating_phase_rounds)  # 确保至少1轮
 
     log_file = setup_logging(run_name=getattr(args, "running_name", "run"))
 
@@ -1763,9 +1788,9 @@ def main():
         except Exception as e:
             logger.error(f"记录wandb指标失败: {str(e)}")
         
-        # 每10轮重新聚类一次
-        if (round_idx + 1) % 10 == 0 and round_idx >= args.initial_phase_rounds:
-            logger.info("重新进行客户端聚类...")
+        # 🔥 使用参数控制的重新聚类间隔
+        if (round_idx + 1) % args.retier_interval == 0 and round_idx >= args.initial_phase_rounds:
+            logger.info(f"重新进行客户端聚类（间隔：{args.retier_interval}轮）...")
             try:
                 cluster_map = clusterer.cluster_clients(
                     client_models=client_models,
@@ -1802,6 +1827,21 @@ def main():
                 global_test_loader, 
                 test_data_local_dict
             )
+            
+            # 🔥 计算客户端特征相似度（使用修复后的函数）
+            try:
+                from analyze.diagnostic_monitor import compute_client_feature_similarity_robust
+                similarity = compute_client_feature_similarity_robust(
+                    client_models, server_model, global_test_loader, device
+                )
+                logger.info(f"轮次 {round_idx+1} 客户端特征平均相似度: {similarity:.4f}")
+                
+                # 记录到wandb
+                if wandb.run:
+                    wandb.log({"diagnostic/feature_similarity": similarity, "round": round_idx + 1})
+                    
+            except Exception as e:
+                logger.warning(f"特征相似度计算失败: {str(e)}")
             
             # 记录验证结果
             try:
